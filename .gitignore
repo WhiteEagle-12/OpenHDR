@@ -1,0 +1,12 @@
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.pdb
+*.exp
+*.lib
+*.ipdb
+*.iobj
