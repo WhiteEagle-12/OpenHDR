@@ -2,6 +2,7 @@
 #include <d3dcompiler.h>
 #include <dwmapi.h>
 #include <dxgi1_6.h>
+#include <commctrl.h>
 #include <windows.h>
 #include <psapi.h>
 #include <windows.graphics.capture.h>
@@ -27,6 +28,7 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "windowsapp.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -183,11 +185,14 @@ static std::atomic<ULONGLONG> g_hotkey_at{0};
 
 static void arm_hotkey() {
   ULONGLONG now = GetTickCount64();
-  ULONGLONG prev = g_hotkey_at.load();
-  if (now - prev < 300) return;
+  if (now - g_hotkey_at.load() < 300) return;
   g_hotkey_at.store(now);
   g_alt_x.store(true);
 }
+static HWND g_status = nullptr;
+static HWND g_enabled = nullptr;
+static HWND g_tracks[5]{};
+static HWND g_values[5]{};
 static IDirect3DDevice g_winrt_dev{nullptr};
 static GraphicsCaptureItem g_item{nullptr};
 static Direct3D11CaptureFramePool g_pool{nullptr};
@@ -332,11 +337,11 @@ static void place_ui() {
   HMONITOR mon = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
   MONITORINFO mi{sizeof(mi)};
   if (!GetMonitorInfoW(mon, &mi)) return;
-  constexpr int width = 420;
-  constexpr int height = 360;
+  constexpr int width = 540;
+  constexpr int height = 490;
   int x = mi.rcWork.left + 48;
   int y = mi.rcWork.top + 48;
-  SetWindowPos(g_ui, HWND_TOPMOST, x, y, width, height, SWP_SHOWWINDOW);
+  SetWindowPos(g_ui, g_target ? HWND_TOPMOST : HWND_NOTOPMOST, x, y, width, height, SWP_SHOWWINDOW);
 }
 
 static void place_overlay(HWND target, UINT capture_width, UINT capture_height) {
@@ -435,7 +440,7 @@ static bool ensure_swapchain(UINT w, UINT h) {
   sd.SampleDesc.Count = 1;
   sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_UNORDERED_ACCESS;
   sd.BufferCount = 2;
-  sd.Scaling = DXGI_SCALING_STRETCH;
+  sd.Scaling = DXGI_SCALING_NONE;
   sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
   sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
   IDXGISwapChain1 *sc1 = nullptr;
@@ -582,81 +587,83 @@ static void map_frame(ID3D11Texture2D *cap) {
   g_swap->Present(0, DXGI_PRESENT_ALLOW_TEARING);
 }
 
-static void draw_menu(HDC dc, int w, int h) {
-  RECT rc{16, 16, std::min(w - 16, 544), std::min(h - 16, 264)};
-  HBRUSH bg = CreateSolidBrush(RGB(16, 16, 18));
-  FillRect(dc, &rc, bg);
-  DeleteObject(bg);
-  SetBkMode(dc, TRANSPARENT);
-  SetTextColor(dc, RGB(236, 236, 230));
-  wchar_t line[128];
-  int y = 28;
-  auto row = [&](const wchar_t *name, float v) {
-    swprintf_s(line, L"%s  %.0f", name, v);
-    TextOutW(dc, 28, y, line, (int)wcslen(line));
-    y += 28;
-  };
-  TextOutW(dc, 28, y, g_set.enabled ? L"OpenHDR  ON" : L"OpenHDR  OFF", (int)wcslen(g_set.enabled ? L"OpenHDR  ON" : L"OpenHDR  OFF"));
-  y += 28;
-  if (g_target_name[0]) {
-    swprintf_s(line, L"Attached  %s", g_target_name);
-    TextOutW(dc, 28, y, line, (int)wcslen(line));
-  } else {
-    TextOutW(dc, 28, y, L"Not attached. Focus a game, Alt+X.", 34);
-  }
-  y += 32;
-  row(L"Peak", g_set.peak);
-  row(L"Paper white", g_set.paper);
-  row(L"Contrast", g_set.contrast);
-  row(L"Saturation", g_set.sat);
-  row(L"Deband %", g_set.deband * 100);
-  TextOutW(dc, 28, y + 8, L"Alt+X hide    1 on/off    arrows change", 38);
+static const wchar_t *kSliderNames[5] = {L"Peak brightness (nits)", L"Paper white (nits)", L"Contrast",
+                                          L"Saturation", L"Deband (%)"};
+static int slider_value(int i) {
+  if (i == 0) return (int)g_set.peak;
+  if (i == 1) return (int)g_set.paper;
+  if (i == 2) return (int)g_set.contrast;
+  if (i == 3) return (int)g_set.sat;
+  return (int)std::lround(g_set.deband * 100.0f);
 }
 
-static void handle_menu_keys() {
-  if (!g_menu) return;
-  auto edge = [](int vk) { return (GetAsyncKeyState(vk) & 1) != 0; };
-  bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-  float step = shift ? 10.0f : 1.0f;
-  if (edge(VK_LEFT) || edge(VK_DOWN)) {
-    if (g_menu) {
+static void set_slider_value(int i, int value) {
+  if (i == 0) g_set.peak = (float)value;
+  else if (i == 1) g_set.paper = (float)value;
+  else if (i == 2) g_set.contrast = (float)value;
+  else if (i == 3) g_set.sat = (float)value;
+  else g_set.deband = value / 100.0f;
+}
+
+static void refresh_ui() {
+  if (!g_ui) return;
+  wchar_t text[160]{};
+  if (g_target_name[0])
+    swprintf_s(text, L"Attached to %s. Alt+X shows or hides this window.", g_target_name);
+  else
+    wcscpy_s(text, L"Waiting: focus a borderless/windowed game and press Alt+X.");
+  if (g_status) SetWindowTextW(g_status, text);
+  if (g_enabled) SendMessageW(g_enabled, BM_SETCHECK, g_set.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+  for (int i = 0; i < 5; ++i) {
+    if (g_tracks[i]) SendMessageW(g_tracks[i], TBM_SETPOS, TRUE, slider_value(i));
+    if (g_values[i]) {
+      swprintf_s(text, L"%d", slider_value(i));
+      SetWindowTextW(g_values[i], text);
     }
   }
-  if (GetAsyncKeyState('1') & 1) {
-    g_set.enabled = !g_set.enabled;
-    g_cb_dirty = true;
+}
+
+static void create_ui_controls(HWND hwnd) {
+  HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+  auto make_static = [&](const wchar_t *text, int x, int y, int w, int h) {
+    HWND c = CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE, x, y, w, h, hwnd, nullptr, nullptr, nullptr);
+    SendMessageW(c, WM_SETFONT, (WPARAM)font, TRUE);
+    return c;
+  };
+  HWND title = make_static(L"OpenHDR", 24, 18, 300, 28);
+  SendMessageW(title, WM_SETFONT, (WPARAM)font, TRUE);
+  g_status = make_static(L"", 24, 50, 474, 36);
+  g_enabled = CreateWindowExW(0, L"BUTTON", L"Enable HDR conversion", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                              24, 92, 220, 24, hwnd, (HMENU)100, nullptr, nullptr);
+  SendMessageW(g_enabled, WM_SETFONT, (WPARAM)font, TRUE);
+  const int mins[5] = {400, 10, 0, 0, 0};
+  const int maxs[5] = {2000, 100, 200, 200, 100};
+  const int pages[5] = {100, 10, 25, 25, 10};
+  for (int i = 0; i < 5; ++i) {
+    int y = 130 + i * 54;
+    make_static(kSliderNames[i], 24, y, 220, 20);
+    g_values[i] = make_static(L"", 454, y, 44, 20);
+    g_tracks[i] = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS,
+                                  22, y + 20, 476, 28, hwnd, (HMENU)(INT_PTR)(200 + i), nullptr, nullptr);
+    SendMessageW(g_tracks[i], TBM_SETRANGE, TRUE, MAKELPARAM(mins[i], maxs[i]));
+    SendMessageW(g_tracks[i], TBM_SETPAGESIZE, 0, pages[i]);
+    SendMessageW(g_tracks[i], TBM_SETLINESIZE, 0, i == 0 ? 10 : 1);
   }
-  if (GetAsyncKeyState(VK_LEFT) & 1) {
-    if (GetAsyncKeyState('2') & 0x8000) g_set.peak = std::max(400.0f, g_set.peak - step);
-    else if (GetAsyncKeyState('3') & 0x8000) g_set.paper = std::max(10.0f, g_set.paper - step);
-    else if (GetAsyncKeyState('4') & 0x8000) g_set.contrast = std::max(0.0f, g_set.contrast - step);
-    else if (GetAsyncKeyState('5') & 0x8000) g_set.sat = std::max(0.0f, g_set.sat - step);
-    else if (GetAsyncKeyState('6') & 0x8000) g_set.deband = std::max(0.0f, g_set.deband - step / 100.0f);
-    else g_set.peak = std::max(400.0f, g_set.peak - step);
-    g_cb_dirty = true;
-    save_settings();
-  }
-  if (GetAsyncKeyState(VK_RIGHT) & 1) {
-    if (GetAsyncKeyState('3') & 0x8000) g_set.paper = std::min(100.0f, g_set.paper + step);
-    else if (GetAsyncKeyState('4') & 0x8000) g_set.contrast = std::min(200.0f, g_set.contrast + step);
-    else if (GetAsyncKeyState('5') & 0x8000) g_set.sat = std::min(200.0f, g_set.sat + step);
-    else if (GetAsyncKeyState('6') & 0x8000) g_set.deband = std::min(1.0f, g_set.deband + step / 100.0f);
-    else g_set.peak = std::min(2000.0f, g_set.peak + step);
-    g_cb_dirty = true;
-    save_settings();
-  }
+  HWND help = make_static(L"Minimize normally, or press Alt+X to hide/show. Close keeps OpenHDR running.", 24, 404, 474, 32);
+  SendMessageW(help, WM_SETFONT, (WPARAM)font, TRUE);
+  refresh_ui();
 }
 
 static LRESULT CALLBACK overlay_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   if (msg == WM_DESTROY) PostQuitMessage(0);
-  if (msg == WM_HOTKEY && wp == 1) {
-    arm_hotkey();
-    return 0;
-  }
   return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 static LRESULT CALLBACK ui_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+  if (msg == WM_CREATE) {
+    create_ui_controls(hwnd);
+    return 0;
+  }
   if (msg == WM_CLOSE) {
     g_menu = false;
     save_settings();
@@ -667,31 +674,29 @@ static LRESULT CALLBACK ui_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     arm_hotkey();
     return 0;
   }
-  if (msg == WM_PAINT) {
-    PAINTSTRUCT ps{};
-    HDC dc = BeginPaint(hwnd, &ps);
-    RECT rc{};
-    GetClientRect(hwnd, &rc);
-    HBRUSH bg = CreateSolidBrush(RGB(16, 16, 18));
-    FillRect(dc, &rc, bg);
-    DeleteObject(bg);
-    draw_menu(dc, rc.right, rc.bottom);
-    EndPaint(hwnd, &ps);
+  if (msg == WM_COMMAND && LOWORD(wp) == 100 && HIWORD(wp) == BN_CLICKED) {
+    g_set.enabled = SendMessageW(g_enabled, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    g_cb_dirty = true;
+    save_settings();
+    return 0;
+  }
+  if (msg == WM_HSCROLL) {
+    HWND source = (HWND)lp;
+    for (int i = 0; i < 5; ++i) {
+      if (source != g_tracks[i]) continue;
+      set_slider_value(i, (int)SendMessageW(source, TBM_GETPOS, 0, 0));
+      g_cb_dirty = true;
+      refresh_ui();
+      save_settings();
+      break;
+    }
+    return 0;
+  }
+  if (msg == WM_SIZE) {
+    g_menu = wp != SIZE_MINIMIZED;
     return 0;
   }
   return DefWindowProcW(hwnd, msg, wp, lp);
-}
-
-static LRESULT CALLBACK llkb(int code, WPARAM wp, LPARAM lp) {
-  if (code == HC_ACTION && (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN)) {
-    auto *k = reinterpret_cast<KBDLLHOOKSTRUCT *>(lp);
-    if (k && k->vkCode == 'X' && (GetAsyncKeyState(VK_MENU) & 0x8000)) {
-      arm_hotkey();
-      if (g_ui) PostMessageW(g_ui, WM_APP, 0, 0);
-      return 1;
-    }
-  }
-  return CallNextHookEx(nullptr, code, wp, lp);
 }
 
 static bool init_gpu() {
@@ -745,8 +750,9 @@ static bool init_gpu() {
 
 static void show_settings() {
   g_menu = true;
+  ShowWindow(g_ui, IsIconic(g_ui) ? SW_RESTORE : SW_SHOW);
   place_ui();
-  InvalidateRect(g_ui, nullptr, TRUE);
+  refresh_ui();
   SetForegroundWindow(g_ui);
 }
 
@@ -754,6 +760,17 @@ static void hide_settings() {
   g_menu = false;
   save_settings();
   if (g_ui) ShowWindow(g_ui, SW_HIDE);
+}
+
+static LRESULT CALLBACK llkb(int code, WPARAM wp, LPARAM lp) {
+  if (code == HC_ACTION && (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN)) {
+    auto *k = reinterpret_cast<KBDLLHOOKSTRUCT *>(lp);
+    if (k && k->vkCode == 'X' && (GetAsyncKeyState(VK_MENU) & 0x8000)) {
+      arm_hotkey();
+      return 1;
+    }
+  }
+  return CallNextHookEx(nullptr, code, wp, lp);
 }
 
 static void on_hotkey() {
@@ -764,21 +781,23 @@ static void on_hotkey() {
       g_placed = {};
       exe_name(target, g_target_name, 64);
       set_clickthrough(true);
+      refresh_ui();
     }
   }
-  if (g_menu) hide_settings();
+  if (g_ui && IsWindowVisible(g_ui) && !IsIconic(g_ui)) hide_settings();
   else show_settings();
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  INITCOMMONCONTROLSEX common{sizeof(common), ICC_BAR_CLASSES};
+  InitCommonControlsEx(&common);
   HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\OpenHDR_desktop_overlay");
   if (GetLastError() == ERROR_ALREADY_EXISTS) {
     HWND existing = FindWindowW(L"OpenHDRSettings", nullptr);
     if (existing) {
-      ShowWindow(existing, SW_SHOW);
+      ShowWindow(existing, SW_RESTORE);
       SetForegroundWindow(existing);
-      PostMessageW(existing, WM_HOTKEY, 1, 0);
     }
     return 0;
   }
@@ -800,16 +819,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   uiw.lpfnWndProc = ui_proc;
   uiw.hInstance = inst;
   uiw.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-  uiw.hbrBackground = CreateSolidBrush(RGB(16, 16, 18));
+  uiw.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
   uiw.lpszClassName = L"OpenHDRSettings";
   RegisterClassExW(&uiw);
 
   g_overlay = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT, wc.lpszClassName,
                               L"OpenHDR", WS_POPUP, 0, 0, 64, 64, nullptr, nullptr, inst, nullptr);
-  g_ui = CreateWindowExW(WS_EX_TOPMOST | WS_EX_APPWINDOW, uiw.lpszClassName, L"OpenHDR",
-                         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, 80, 80, 420, 360, nullptr, nullptr, inst, nullptr);
+  g_ui = CreateWindowExW(WS_EX_APPWINDOW, uiw.lpszClassName, L"OpenHDR Settings",
+                         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, 80, 80, 540, 490,
+                         nullptr, nullptr, inst, nullptr);
   RegisterHotKey(g_ui, 1, MOD_ALT | MOD_NOREPEAT, 'X');
-  RegisterHotKey(g_overlay, 1, MOD_ALT | MOD_NOREPEAT, 'X');
   SetWindowsHookExW(WH_KEYBOARD_LL, llkb, inst, 0);
   show_settings();
 
@@ -817,12 +836,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   for (;;) {
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
       if (msg.message == WM_QUIT) return 0;
-      if (msg.message == WM_APP) arm_hotkey();
       TranslateMessage(&msg);
       DispatchMessageW(&msg);
     }
     if (g_alt_x.exchange(false)) on_hotkey();
-    if (g_menu) handle_menu_keys();
 
     HWND fg = GetForegroundWindow();
     if (g_target && !IsWindow(g_target)) {
@@ -848,6 +865,5 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
       map_frame(tex);
       tex->Release();
     }
-    if (g_menu) InvalidateRect(g_ui, nullptr, FALSE);
   }
 }
