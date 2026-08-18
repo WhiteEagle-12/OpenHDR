@@ -1,10 +1,13 @@
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <dwmapi.h>
+#include <shellapi.h>
 #include <dxgi1_6.h>
 #include <commctrl.h>
 #include <windows.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <windows.graphics.capture.h>
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
@@ -28,17 +31,23 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "windowsapp.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "psapi.lib")
 
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
+
 using namespace winrt;
 using namespace winrt::Windows::Graphics::Capture;
 using namespace winrt::Windows::Graphics::DirectX;
 using namespace winrt::Windows::Graphics::DirectX::Direct3D11;
 
+constexpr UINT WM_TOGGLE_HDR = WM_APP + 30;
 constexpr int kN = 49;
 constexpr UINT kAtlasKnots = 17u * 10u * 9u * 64u;
 constexpr float kUiWhiteScRgb = 203.0f / 80.0f;
@@ -171,12 +180,34 @@ static ID3D11ShaderResourceView *g_cap_srv[2] = {};
 static HWND g_overlay = nullptr;
 static HWND g_ui = nullptr;
 static HWND g_target = nullptr;
+static HWND g_host = nullptr;
+static HWND g_last_game = nullptr;
+static HWND g_attach_fail = nullptr;
+static bool g_monitor_cap = false;
+static HANDLE g_toggle_ev = nullptr;
+static HANDLE g_frame_ev = nullptr;
+static HANDLE g_present_th = nullptr;
+static HANDLE g_present_stop = nullptr;
+static IDXGIOutput *g_output = nullptr;
+static ID3D11Texture2D *g_owned = nullptr;
+static UINT g_owned_w = 0, g_owned_h = 0;
+static CRITICAL_SECTION g_cap_cs;
+static std::atomic<bool> g_present_run{false};
+static std::atomic<bool> g_allow_present{false};
+static std::atomic<ULONGLONG> g_frame_tick{0};
+static winrt::event_token g_frame_tok{};
+static ULONGLONG g_toggle_at = 0;
+static void try_attach(HWND host);
+static void hide_overlay();
+static HWND resolve_game();
+static ID3D11UnorderedAccessView *uav_for_backbuffer();
 static wchar_t g_target_name[64] = L"";
 static UINT g_w = 0, g_h = 0;
 static RECT g_placed{};
 static int g_pool_w = 0, g_pool_h = 0;
 static Settings g_set{};
 static bool g_menu = true;
+static bool g_hidden = true;
 static bool g_has_atlas = false;
 static bool g_cb_dirty = true;
 static float g_sat_scales[9] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
@@ -185,7 +216,7 @@ static std::atomic<ULONGLONG> g_hotkey_at{0};
 
 static void arm_hotkey() {
   ULONGLONG now = GetTickCount64();
-  if (now - g_hotkey_at.load() < 300) return;
+  if (now - g_hotkey_at.load() < 400) return;
   g_hotkey_at.store(now);
   g_alt_x.store(true);
 }
@@ -257,8 +288,8 @@ static float sat_scale(float sat) {
 
 static bool skip_exe(const wchar_t *name) {
   static const wchar_t *bad[] = {
-      L"explorer.exe", L"SearchHost.exe", L"TextInputHost.exe", L"ApplicationFrameHost.exe",
-      L"ShellExperienceHost.exe", L"StartMenuExperienceHost.exe", L"SystemSettings.exe", L"ApplicationFrameHost.exe",
+      L"explorer.exe", L"SearchHost.exe", L"TextInputHost.exe",
+      L"ShellExperienceHost.exe", L"StartMenuExperienceHost.exe", L"SystemSettings.exe",
       L"chrome.exe", L"msedge.exe", L"msedgewebview2.exe", L"firefox.exe", L"brave.exe", L"opera.exe",
       L"Discord.exe", L"Slack.exe", L"Spotify.exe", L"Teams.exe", L"OUTLOOK.EXE", L"WINWORD.EXE",
       L"EXCEL.EXE", L"POWERPNT.EXE", L"Code.exe", L"Cursor.exe", L"devenv.exe", L"notepad.exe",
@@ -299,54 +330,162 @@ static bool exe_name(HWND hwnd, wchar_t *out, size_t outn) {
   return true;
 }
 
-static HWND pick_target() {
-  HWND fg = GetForegroundWindow();
-  if (!fg || fg == g_overlay || fg == g_ui) return nullptr;
+static bool is_our_hwnd(HWND fg) {
+  if (!fg || fg == g_overlay || fg == g_ui) return true;
   wchar_t cls[64]{};
   GetClassNameW(fg, cls, 64);
-  if (!_wcsicmp(cls, L"OpenHDROverlay") || !_wcsicmp(cls, L"OpenHDRSettings")) return nullptr;
-  LONG style = GetWindowLongW(fg, GWL_STYLE);
-  LONG ex = GetWindowLongW(fg, GWL_EXSTYLE);
-  if (ex & WS_EX_TOOLWINDOW) return nullptr;
-  if (!(style & WS_VISIBLE)) return nullptr;
+  return !_wcsicmp(cls, L"OpenHDROverlay") || !_wcsicmp(cls, L"OpenHDRSettings") || !_wcsicmp(cls, L"OpenHDRMain");
+}
+
+static bool is_game_hwnd(HWND fg) {
+  if (!fg || !IsWindow(fg) || is_our_hwnd(fg)) return false;
   DWORD pid = 0;
   GetWindowThreadProcessId(fg, &pid);
-  if (!pid || pid == GetCurrentProcessId()) return nullptr;
+  if (!pid || pid == GetCurrentProcessId()) return false;
   wchar_t name[64]{};
   exe_name(fg, name, 64);
-  if (name[0] && skip_exe(name)) return nullptr;
+  if (name[0] && skip_exe(name)) return false;
   RECT rc{};
   GetClientRect(fg, &rc);
-  if ((rc.right - rc.left) < 640 || (rc.bottom - rc.top) < 360) return nullptr;
+  if ((rc.right - rc.left) < 320 || (rc.bottom - rc.top) < 240) return false;
+  return true;
+}
+
+static HWND pick_target_from(HWND fg) {
+  if (!is_game_hwnd(fg)) return nullptr;
+  LONG style = GetWindowLongW(fg, GWL_STYLE);
+  if (!(style & WS_VISIBLE)) return nullptr;
   if (!IsWindowVisible(fg) || IsIconic(fg) || is_cloaked(fg)) return nullptr;
   return fg;
 }
 
-static void set_clickthrough(bool through) {
+struct PidPick {
+  DWORD pid;
+  HWND best;
+  long area;
+};
+
+static BOOL CALLBACK enum_pid_window(HWND w, LPARAM lp) {
+  auto *pick = reinterpret_cast<PidPick *>(lp);
+  DWORD pid = 0;
+  GetWindowThreadProcessId(w, &pid);
+  if (pid != pick->pid || is_our_hwnd(w) || !IsWindowVisible(w)) return TRUE;
+  RECT rc{};
+  GetClientRect(w, &rc);
+  long area = (long)(rc.right - rc.left) * (long)(rc.bottom - rc.top);
+  if (area > pick->area && (rc.right - rc.left) >= 64 && (rc.bottom - rc.top) >= 64) {
+    pick->best = w;
+    pick->area = area;
+  }
+  return TRUE;
+}
+
+static HWND best_window_for_pid(DWORD pid) {
+  if (!pid) return nullptr;
+  PidPick pick{pid, nullptr, 0};
+  EnumWindows(enum_pid_window, reinterpret_cast<LPARAM>(&pick));
+  return pick.best;
+}
+
+static HWND window_for_host(HWND host) {
+  HWND w = pick_target_from(host);
+  if (w) return w;
+  if (!host || !IsWindow(host) || is_our_hwnd(host)) return nullptr;
+  DWORD pid = 0;
+  GetWindowThreadProcessId(host, &pid);
+  wchar_t name[64]{};
+  exe_name(host, name, 64);
+  if (name[0] && skip_exe(name)) return nullptr;
+  HWND best = best_window_for_pid(pid);
+  if (best && (pick_target_from(best) || is_game_hwnd(best))) return best;
+  return nullptr;
+}
+
+static BOOL CALLBACK enum_top_game(HWND w, LPARAM lp) {
+  if (!pick_target_from(w)) return TRUE;
+  *reinterpret_cast<HWND *>(lp) = w;
+  return FALSE;
+}
+
+static HWND top_game() {
+  HWND found = nullptr;
+  EnumWindows(enum_top_game, reinterpret_cast<LPARAM>(&found));
+  return found;
+}
+
+static HWND resolve_game() {
+  HWND fg = window_for_host(GetForegroundWindow());
+  if (fg) return fg;
+  if (g_last_game && (pick_target_from(g_last_game) || (IsWindow(g_last_game) && is_game_hwnd(g_last_game))))
+    return g_last_game;
+  return top_game();
+}
+
+static HWND pick_target() { return pick_target_from(GetForegroundWindow()); }
+
+static void set_clickthrough(bool) {
   if (!g_overlay) return;
   LONG ex = GetWindowLongW(g_overlay, GWL_EXSTYLE);
-  if (through) ex |= WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
-  else ex &= ~WS_EX_TRANSPARENT;
+  ex &= ~WS_EX_LAYERED;
+  ex |= WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP;
   SetWindowLongW(g_overlay, GWL_EXSTYLE, ex);
+  SetWindowDisplayAffinity(g_overlay, WDA_EXCLUDEFROMCAPTURE);
+  SetWindowPos(g_overlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
+static void hide_overlay() {
+  if (!g_overlay || g_hidden) return;
+  ShowWindow(g_overlay, SW_HIDE);
+  SetWindowPos(g_overlay, HWND_BOTTOM, -32000, -32000, 1, 1, SWP_NOACTIVATE | SWP_HIDEWINDOW);
+  g_placed = {};
+  g_hidden = true;
+}
+
+static bool settings_open() {
+  return g_ui && !IsIconic(g_ui) && (GetWindowLongW(g_ui, GWL_STYLE) & WS_VISIBLE);
+}
+
+static void raise_ui() {
+  if (!g_ui || IsIconic(g_ui) || !settings_open()) return;
+  SetWindowPos(g_ui, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 static void place_ui() {
   if (!g_ui) return;
-  POINT cursor{};
-  GetCursorPos(&cursor);
-  HMONITOR mon = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
-  MONITORINFO mi{sizeof(mi)};
-  if (!GetMonitorInfoW(mon, &mi)) return;
   constexpr int width = 540;
   constexpr int height = 490;
-  int x = mi.rcWork.left + 48;
-  int y = mi.rcWork.top + 48;
-  SetWindowPos(g_ui, g_target ? HWND_TOPMOST : HWND_NOTOPMOST, x, y, width, height, SWP_SHOWWINDOW);
+  HWND host = g_host;
+  if (!host || host == g_ui || host == g_overlay || !IsWindow(host)) host = g_target;
+  RECT frame{};
+  int x = 48, y = 48;
+  if (host && host != g_ui && host != g_overlay && window_frame(host, &frame)) {
+    x = frame.left + 24;
+    y = frame.top + 24;
+    if (x + width > frame.right - 8) x = std::max(frame.left + 8, frame.right - width - 8);
+    if (y + height > frame.bottom - 8) y = std::max(frame.top + 8, frame.bottom - height - 8);
+  } else {
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    HMONITOR mon = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi{sizeof(mi)};
+    if (GetMonitorInfoW(mon, &mi)) {
+      x = mi.rcWork.left + 48;
+      y = mi.rcWork.top + 48;
+    }
+  }
+  SetWindowPos(g_ui, HWND_TOPMOST, x, y, width, height, SWP_SHOWWINDOW);
 }
 
 static void place_overlay(HWND target, UINT capture_width, UINT capture_height) {
   RECT frame{};
-  window_frame(target, &frame);
+  if (g_monitor_cap) {
+    HMONITOR mon = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{sizeof(mi)};
+    if (GetMonitorInfoW(mon, &mi)) frame = mi.rcMonitor;
+    else window_frame(target, &frame);
+  } else {
+    window_frame(target, &frame);
+  }
   int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
   int w = (int)capture_width, h = (int)capture_height;
   if (fw > 32 && fh > 32 && std::abs(w - fw) <= 16 && std::abs(h - fh) <= 16) {
@@ -357,6 +496,7 @@ static void place_overlay(HWND target, UINT capture_width, UINT capture_height) 
   if (want.left == g_placed.left && want.top == g_placed.top && want.right == g_placed.right && want.bottom == g_placed.bottom)
     return;
   g_placed = want;
+  g_hidden = false;
   SetWindowPos(g_overlay, HWND_TOPMOST, want.left, want.top, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
@@ -416,10 +556,15 @@ static ID3D11ShaderResourceView *srv_for_cap(ID3D11Texture2D *tex) {
 }
 
 static bool ensure_swapchain(UINT w, UINT h) {
+  if (g_swap && g_w == w && g_h == h) return true;
   if (g_swap) {
     DXGI_SWAP_CHAIN_DESC sd{};
     g_swap->GetDesc(&sd);
-    if (sd.BufferDesc.Width == w && sd.BufferDesc.Height == h) return true;
+    if (sd.BufferDesc.Width == w && sd.BufferDesc.Height == h) {
+      g_w = w;
+      g_h = h;
+      return true;
+    }
     release_bb();
     if (FAILED(g_swap->ResizeBuffers(0, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING))) return false;
     g_w = w;
@@ -440,7 +585,7 @@ static bool ensure_swapchain(UINT w, UINT h) {
   sd.SampleDesc.Count = 1;
   sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_UNORDERED_ACCESS;
   sd.BufferCount = 2;
-  sd.Scaling = DXGI_SCALING_NONE;
+  sd.Scaling = DXGI_SCALING_STRETCH;
   sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
   sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
   IDXGISwapChain1 *sc1 = nullptr;
@@ -457,7 +602,32 @@ static bool ensure_swapchain(UINT w, UINT h) {
   return true;
 }
 
-static void stop_capture() {
+static HANDLE frame_event() {
+  if (!g_frame_ev) g_frame_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  return g_frame_ev;
+}
+
+static void unbind_frames() {
+  if (g_pool && g_frame_tok.value) {
+    try {
+      g_pool.FrameArrived(g_frame_tok);
+    } catch (...) {
+    }
+  }
+  g_frame_tok = {};
+}
+
+static void bind_frames() {
+  unbind_frames();
+  if (!g_pool) return;
+  frame_event();
+  g_frame_tok = g_pool.FrameArrived([](auto &&, auto &&) {
+    if (g_frame_ev) SetEvent(g_frame_ev);
+  });
+}
+
+static void stop_capture_unlocked() {
+  unbind_frames();
   try {
     if (g_session) g_session.Close();
   } catch (...) {
@@ -473,6 +643,12 @@ static void stop_capture() {
   release_caps();
 }
 
+static void stop_capture() {
+  EnterCriticalSection(&g_cap_cs);
+  stop_capture_unlocked();
+  LeaveCriticalSection(&g_cap_cs);
+}
+
 static IDirect3DDevice wrap_device(ID3D11Device *dev) {
   IDXGIDevice *dxgi = nullptr;
   dev->QueryInterface(&dxgi);
@@ -485,16 +661,11 @@ static IDirect3DDevice wrap_device(ID3D11Device *dev) {
   return out;
 }
 
-static bool start_capture(HWND hwnd) {
-  stop_capture();
-  auto interop = get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
-  GraphicsCaptureItem item{nullptr};
-  if (FAILED(interop->CreateForWindow(hwnd, guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(), put_abi(item))))
-    return false;
+static bool start_item(GraphicsCaptureItem const &item) {
   auto size = item.Size();
   if (size.Width < 16 || size.Height < 16) return false;
   g_item = item;
-  g_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(g_winrt_dev, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
+  g_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(g_winrt_dev, DirectXPixelFormat::B8G8R8A8UIntNormalized, 3, size);
   g_pool_w = size.Width;
   g_pool_h = size.Height;
   g_session = g_pool.CreateCaptureSession(g_item);
@@ -507,7 +678,32 @@ static bool start_capture(HWND hwnd) {
   } catch (...) {
   }
   g_session.StartCapture();
+  bind_frames();
   return true;
+}
+
+static bool start_capture(HWND hwnd) {
+  EnterCriticalSection(&g_cap_cs);
+  stop_capture_unlocked();
+  g_monitor_cap = false;
+  auto interop = get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  HWND cands[3] = {hwnd, GetAncestor(hwnd, GA_ROOT), best_window_for_pid(pid)};
+  for (HWND cand : cands) {
+    if (!cand || !IsWindow(cand)) continue;
+    GraphicsCaptureItem item{nullptr};
+    if (FAILED(interop->CreateForWindow(cand, guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
+                                        put_abi(item))))
+      continue;
+    if (start_item(item)) {
+      LeaveCriticalSection(&g_cap_cs);
+      return true;
+    }
+    stop_capture_unlocked();
+  }
+  LeaveCriticalSection(&g_cap_cs);
+  return false;
 }
 
 static void sync_pool() {
@@ -516,7 +712,7 @@ static void sync_pool() {
   if (size.Width < 16 || size.Height < 16) return;
   if (size.Width == g_pool_w && size.Height == g_pool_h) return;
   try {
-    g_pool.Recreate(g_winrt_dev, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
+    g_pool.Recreate(g_winrt_dev, DirectXPixelFormat::B8G8R8A8UIntNormalized, 3, size);
     g_pool_w = size.Width;
     g_pool_h = size.Height;
     release_caps();
@@ -525,21 +721,31 @@ static void sync_pool() {
   }
 }
 
-static ID3D11Texture2D *frame_tex() {
-  if (!g_pool) return nullptr;
-  sync_pool();
-  Direct3D11CaptureFrame frame{nullptr};
-  try {
-    frame = g_pool.TryGetNextFrame();
-  } catch (...) {
-    return nullptr;
-  }
+static ID3D11Texture2D *tex_from_frame(Direct3D11CaptureFrame const &frame) {
   if (!frame) return nullptr;
   auto surf = frame.Surface();
   auto access = surf.as<Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
   ID3D11Texture2D *tex = nullptr;
   access->GetInterface(IID_PPV_ARGS(&tex));
   return tex;
+}
+
+static ID3D11Texture2D *frame_tex() {
+  if (!g_pool) return nullptr;
+  sync_pool();
+  ID3D11Texture2D *latest = nullptr;
+  try {
+    for (;;) {
+      auto frame = g_pool.TryGetNextFrame();
+      if (!frame) break;
+      if (latest) latest->Release();
+      latest = tex_from_frame(frame);
+    }
+  } catch (...) {
+    if (latest) latest->Release();
+    return nullptr;
+  }
+  return latest;
 }
 
 static void write_cb(UINT w, UINT h) {
@@ -565,15 +771,63 @@ static void write_cb(UINT w, UINT h) {
   g_cb_dirty = false;
 }
 
-static void map_frame(ID3D11Texture2D *cap) {
-  D3D11_TEXTURE2D_DESC td{};
-  cap->GetDesc(&td);
-  if (!ensure_swapchain(td.Width, td.Height)) return;
-  ID3D11UnorderedAccessView *uav = uav_for_backbuffer();
-  ID3D11ShaderResourceView *src = srv_for_cap(cap);
-  if (!uav || !src) return;
-  if (g_cb_dirty) write_cb(td.Width, td.Height);
+static void bind_output(HWND hwnd) {
+  if (g_output) {
+    g_output->Release();
+    g_output = nullptr;
+  }
+  if (!g_dev) return;
+  IDXGIDevice *dd = nullptr;
+  if (FAILED(g_dev->QueryInterface(&dd)) || !dd) return;
+  IDXGIAdapter *ad = nullptr;
+  dd->GetAdapter(&ad);
+  dd->Release();
+  if (!ad) return;
+  HMONITOR mon = MonitorFromWindow(hwnd ? hwnd : g_overlay, MONITOR_DEFAULTTONEAREST);
+  IDXGIOutput *out = nullptr;
+  for (UINT i = 0; ad->EnumOutputs(i, &out) != DXGI_ERROR_NOT_FOUND; ++i) {
+    DXGI_OUTPUT_DESC desc{};
+    out->GetDesc(&desc);
+    if (desc.Monitor == mon) {
+      g_output = out;
+      break;
+    }
+    out->Release();
+  }
+  ad->Release();
+}
 
+static bool ensure_owned(UINT w, UINT h, DXGI_FORMAT fmt) {
+  if (g_owned && g_owned_w == w && g_owned_h == h) return true;
+  if (g_owned) {
+    g_owned->Release();
+    g_owned = nullptr;
+  }
+  release_caps();
+  D3D11_TEXTURE2D_DESC d{};
+  d.Width = w;
+  d.Height = h;
+  d.MipLevels = 1;
+  d.ArraySize = 1;
+  d.Format = fmt;
+  d.SampleDesc.Count = 1;
+  d.Usage = D3D11_USAGE_DEFAULT;
+  d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &g_owned)) || !g_owned) return false;
+  g_owned_w = w;
+  g_owned_h = h;
+  return true;
+}
+
+static bool shade_owned() {
+  if (!g_owned) return false;
+  D3D11_TEXTURE2D_DESC td{};
+  g_owned->GetDesc(&td);
+  if (!ensure_swapchain(td.Width, td.Height)) return false;
+  ID3D11UnorderedAccessView *uav = uav_for_backbuffer();
+  ID3D11ShaderResourceView *src = srv_for_cap(g_owned);
+  if (!uav || !src) return false;
+  if (g_cb_dirty) write_cb(td.Width, td.Height);
   ID3D11ShaderResourceView *srvs[3] = {g_lut_srv, src, g_atlas_srv};
   g_ctx->CSSetShader(g_cs, nullptr, 0);
   g_ctx->CSSetConstantBuffers(0, 1, &g_cb);
@@ -584,7 +838,49 @@ static void map_frame(ID3D11Texture2D *cap) {
   ID3D11ShaderResourceView *noneS[3] = {};
   g_ctx->CSSetUnorderedAccessViews(0, 1, &noneU, nullptr);
   g_ctx->CSSetShaderResources(0, 3, noneS);
-  g_swap->Present(0, DXGI_PRESENT_ALLOW_TEARING);
+  return true;
+}
+
+static bool copy_latest_capture() {
+  EnterCriticalSection(&g_cap_cs);
+  ID3D11Texture2D *tex = frame_tex();
+  if (!tex) {
+    LeaveCriticalSection(&g_cap_cs);
+    return false;
+  }
+  D3D11_TEXTURE2D_DESC td{};
+  tex->GetDesc(&td);
+  bool ok = ensure_owned(td.Width, td.Height, td.Format);
+  if (ok) g_ctx->CopyResource(g_owned, tex);
+  tex->Release();
+  LeaveCriticalSection(&g_cap_cs);
+  if (ok) {
+    g_frame_tick.store(GetTickCount64());
+    if (g_target) place_overlay(g_target, td.Width, td.Height);
+  }
+  return ok;
+}
+
+static DWORD WINAPI present_thread(void *) {
+  while (g_present_run.load()) {
+    if (!g_allow_present.load()) {
+      WaitForSingleObject(g_present_stop, 8);
+      continue;
+    }
+    if (!copy_latest_capture()) {
+      HANDLE ev = frame_event();
+      WaitForSingleObject(ev ? ev : g_present_stop, 8);
+      continue;
+    }
+    if (!shade_owned()) {
+      Sleep(1);
+      continue;
+    }
+    if (!g_output && g_swap) g_swap->GetContainingOutput(&g_output);
+    if (g_output) g_output->WaitForVBlank();
+    if (g_swap && g_allow_present.load()) g_swap->Present(0, DXGI_PRESENT_ALLOW_TEARING);
+  }
+  return 0;
 }
 
 static const wchar_t *kSliderNames[5] = {L"Peak brightness (nits)", L"Paper white (nits)", L"Contrast",
@@ -608,10 +904,8 @@ static void set_slider_value(int i, int value) {
 static void refresh_ui() {
   if (!g_ui) return;
   wchar_t text[160]{};
-  if (g_target_name[0])
-    swprintf_s(text, L"Attached to %s. Alt+X shows or hides this window.", g_target_name);
-  else
-    wcscpy_s(text, L"Waiting: focus a borderless/windowed game and press Alt+X.");
+  swprintf_s(text, L"HDR %s. Alt+X toggles HDR.  %s", g_set.enabled ? L"ON" : L"OFF",
+             g_target_name[0] ? g_target_name : L"");
   if (g_status) SetWindowTextW(g_status, text);
   if (g_enabled) SendMessageW(g_enabled, BM_SETCHECK, g_set.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
   for (int i = 0; i < 5; ++i) {
@@ -649,12 +943,36 @@ static void create_ui_controls(HWND hwnd) {
     SendMessageW(g_tracks[i], TBM_SETPAGESIZE, 0, pages[i]);
     SendMessageW(g_tracks[i], TBM_SETLINESIZE, 0, i == 0 ? 10 : 1);
   }
-  HWND help = make_static(L"Minimize normally, or press Alt+X to hide/show. Close keeps OpenHDR running.", 24, 404, 474, 32);
+  HWND help = make_static(L"Alt+X toggles HDR on and off. If OpenHDR is closed, Alt+X starts it.", 24, 404, 474, 32);
   SendMessageW(help, WM_SETFONT, (WPARAM)font, TRUE);
   refresh_ui();
 }
 
+static void toggle_hdr() {
+  g_set.enabled = !g_set.enabled;
+  g_cb_dirty = true;
+  save_settings();
+  if (!g_set.enabled) hide_overlay();
+  refresh_ui();
+}
+
+static void apply_toggle() {
+  ULONGLONG now = GetTickCount64();
+  if (now - g_toggle_at < 200) return;
+  g_toggle_at = now;
+  toggle_hdr();
+  g_attach_fail = nullptr;
+  if (g_set.enabled) {
+    HWND game = resolve_game();
+    if (game) try_attach(game);
+  }
+}
+
 static LRESULT CALLBACK overlay_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+  if (msg == WM_TOGGLE_HDR) {
+    apply_toggle();
+    return 0;
+  }
   if (msg == WM_DESTROY) PostQuitMessage(0);
   return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -665,19 +983,30 @@ static LRESULT CALLBACK ui_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return 0;
   }
   if (msg == WM_CLOSE) {
-    g_menu = false;
     save_settings();
-    ShowWindow(hwnd, SW_HIDE);
+    PostQuitMessage(0);
     return 0;
   }
-  if (msg == WM_HOTKEY && wp == 1) {
-    arm_hotkey();
+  if (msg == WM_ACTIVATE && LOWORD(wp) != WA_INACTIVE) {
+    raise_ui();
+    return DefWindowProcW(hwnd, msg, wp, lp);
+  }
+  if (msg == WM_TOGGLE_HDR) {
+    apply_toggle();
     return 0;
   }
   if (msg == WM_COMMAND && LOWORD(wp) == 100 && HIWORD(wp) == BN_CLICKED) {
     g_set.enabled = SendMessageW(g_enabled, BM_GETCHECK, 0, 0) == BST_CHECKED;
     g_cb_dirty = true;
     save_settings();
+    if (g_set.enabled) {
+      g_attach_fail = nullptr;
+      HWND game = resolve_game();
+      if (game) try_attach(game);
+    } else {
+      hide_overlay();
+    }
+    refresh_ui();
     return 0;
   }
   if (msg == WM_HSCROLL) {
@@ -694,7 +1023,7 @@ static LRESULT CALLBACK ui_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   }
   if (msg == WM_SIZE) {
     g_menu = wp != SIZE_MINIMIZED;
-    return 0;
+    return DefWindowProcW(hwnd, msg, wp, lp);
   }
   return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -750,10 +1079,10 @@ static bool init_gpu() {
 
 static void show_settings() {
   g_menu = true;
-  ShowWindow(g_ui, IsIconic(g_ui) ? SW_RESTORE : SW_SHOW);
+  if (IsIconic(g_ui)) ShowWindow(g_ui, SW_RESTORE);
   place_ui();
   refresh_ui();
-  SetForegroundWindow(g_ui);
+  raise_ui();
 }
 
 static void hide_settings() {
@@ -762,45 +1091,188 @@ static void hide_settings() {
   if (g_ui) ShowWindow(g_ui, SW_HIDE);
 }
 
-static LRESULT CALLBACK llkb(int code, WPARAM wp, LPARAM lp) {
-  if (code == HC_ACTION && (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN)) {
+static HWND g_hook_wnd = nullptr;
+
+static HANDLE toggle_event() {
+  if (!g_toggle_ev) g_toggle_ev = CreateEventW(nullptr, FALSE, FALSE, L"Local\\OpenHDR_toggle");
+  return g_toggle_ev;
+}
+
+static HWND find_main_hwnd() {
+  HWND w = FindWindowW(L"OpenHDRMain", nullptr);
+  if (w) return w;
+  w = FindWindowW(L"OpenHDRSettings", nullptr);
+  if (w) return w;
+  return FindWindowW(L"OpenHDROverlay", nullptr);
+}
+
+static bool main_running() {
+  HWND w = find_main_hwnd();
+  return w && IsWindow(w);
+}
+
+static void reap_stuck_mains() {
+  if (main_running()) return;
+  DWORD self = GetCurrentProcessId();
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snap == INVALID_HANDLE_VALUE) return;
+  PROCESSENTRY32W pe{sizeof(pe)};
+  if (Process32FirstW(snap, &pe)) {
+    do {
+      if (pe.th32ProcessID == self || _wcsicmp(pe.szExeFile, L"OpenHDR.exe") != 0) continue;
+      HANDLE p = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+      if (!p) continue;
+      TerminateProcess(p, 0);
+      CloseHandle(p);
+    } while (Process32NextW(snap, &pe));
+  }
+  CloseHandle(snap);
+}
+
+static void launch_main() {
+  wchar_t path[MAX_PATH];
+  GetModuleFileNameW(nullptr, path, MAX_PATH);
+  STARTUPINFOW si{sizeof(si)};
+  PROCESS_INFORMATION pi{};
+  wchar_t cmd[MAX_PATH + 4]{};
+  swprintf_s(cmd, L"\"%s\"", path);
+  if (CreateProcessW(path, cmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+  }
+}
+
+static void dispatch_hotkey() {
+  ULONGLONG now = GetTickCount64();
+  if (now - g_hotkey_at.load() < 250) return;
+  g_hotkey_at.store(now);
+  if (main_running()) {
+    if (HANDLE ev = toggle_event()) SetEvent(ev);
+    if (HWND main = find_main_hwnd()) PostMessageW(main, WM_TOGGLE_HDR, 0, 0);
+    return;
+  }
+  reap_stuck_mains();
+  launch_main();
+}
+
+static LRESULT CALLBACK hook_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+  if (msg == WM_HOTKEY || msg == WM_APP) {
+    dispatch_hotkey();
+    return 0;
+  }
+  return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static LRESULT CALLBACK hook_llkb(int code, WPARAM wp, LPARAM lp) {
+  if (code == HC_ACTION && (wp == WM_SYSKEYDOWN || wp == WM_KEYDOWN)) {
     auto *k = reinterpret_cast<KBDLLHOOKSTRUCT *>(lp);
-    if (k && k->vkCode == 'X' && (GetAsyncKeyState(VK_MENU) & 0x8000)) {
-      arm_hotkey();
+    bool alt = k && ((k->flags & LLKHF_ALTDOWN) || (GetAsyncKeyState(VK_MENU) & 0x8000));
+    if (k && k->vkCode == 'X' && alt && g_hook_wnd) {
+      PostMessageW(g_hook_wnd, WM_APP, 0, 0);
       return 1;
     }
   }
   return CallNextHookEx(nullptr, code, wp, lp);
 }
 
-static void on_hotkey() {
-  HWND target = pick_target();
-  if (target && target != g_target) {
-    if (start_capture(target)) {
-      g_target = target;
-      g_placed = {};
-      exe_name(target, g_target_name, 64);
-      set_clickthrough(true);
-      refresh_ui();
-    }
+static int run_hook(HINSTANCE inst) {
+  HANDLE mtx = CreateMutexW(nullptr, TRUE, L"Local\\OpenHDR_hotkey");
+  if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+  WNDCLASSEXW wc{sizeof(wc)};
+  wc.lpfnWndProc = hook_wnd_proc;
+  wc.hInstance = inst;
+  wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+  wc.lpszClassName = L"OpenHDRHook";
+  RegisterClassExW(&wc);
+  g_hook_wnd = CreateWindowExW(0, wc.lpszClassName, L"OpenHDRHook", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, inst, nullptr);
+  RegisterHotKey(g_hook_wnd, 1, MOD_ALT | MOD_NOREPEAT, 'X');
+  SetWindowsHookExW(WH_KEYBOARD_LL, hook_llkb, inst, 0);
+  MSG msg{};
+  while (GetMessageW(&msg, nullptr, 0, 0)) {
+    TranslateMessage(&msg);
+    DispatchMessageW(&msg);
   }
-  if (g_ui && IsWindowVisible(g_ui) && !IsIconic(g_ui)) hide_settings();
-  else show_settings();
+  return 0;
 }
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+static ULONGLONG g_last_frame = 0;
+static ULONGLONG g_fail_until = 0;
+
+static bool target_alive(HWND hwnd) {
+  if (!hwnd || !IsWindow(hwnd)) return false;
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (!pid) return false;
+  HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!p) return true;
+  DWORD code = STILL_ACTIVE;
+  GetExitCodeProcess(p, &code);
+  CloseHandle(p);
+  return code == STILL_ACTIVE;
+}
+
+static void detach() {
+  hide_overlay();
+  stop_capture();
+  g_monitor_cap = false;
+  g_target = nullptr;
+  g_target_name[0] = 0;
+  g_placed = {};
+  g_last_frame = 0;
+  refresh_ui();
+}
+
+static void try_attach(HWND host) {
+  HWND target = window_for_host(host);
+  if (!target || !IsWindow(target)) return;
+  if (target == g_target && g_session) return;
+  if (target == g_attach_fail && GetTickCount64() < g_fail_until) return;
+  hide_overlay();
+  if (!start_capture(target)) {
+    g_attach_fail = target;
+    g_fail_until = GetTickCount64() + 1000;
+    return;
+  }
+  g_attach_fail = nullptr;
+  g_fail_until = 0;
+  g_target = target;
+  g_last_game = target;
+  g_placed = {};
+  exe_name(target, g_target_name, 64);
+  bind_output(target);
+  set_clickthrough(true);
+  refresh_ui();
+}
+
+static void ensure_hook(HINSTANCE inst) {
+  HANDLE mtx = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\OpenHDR_hotkey");
+  if (mtx) {
+    CloseHandle(mtx);
+    return;
+  }
+  wchar_t path[MAX_PATH];
+  GetModuleFileNameW(inst, path, MAX_PATH);
+  ShellExecuteW(nullptr, L"open", path, L"--hook", nullptr, SW_HIDE);
+}
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  if (cmd && wcsstr(cmd, L"--hook")) return run_hook(inst);
   INITCOMMONCONTROLSEX common{sizeof(common), ICC_BAR_CLASSES};
   InitCommonControlsEx(&common);
+  bool background = cmd && wcsstr(cmd, L"--background");
   HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\OpenHDR_desktop_overlay");
-  if (GetLastError() == ERROR_ALREADY_EXISTS) {
-    HWND existing = FindWindowW(L"OpenHDRSettings", nullptr);
-    if (existing) {
-      ShowWindow(existing, SW_RESTORE);
-      SetForegroundWindow(existing);
-    }
-    return 0;
-  }
+  if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+  toggle_event();
+  frame_event();
+  InitializeCriticalSection(&g_cap_cs);
+
+  WNDCLASSEXW mainwc{sizeof(mainwc)};
+  mainwc.lpfnWndProc = overlay_proc;
+  mainwc.hInstance = inst;
+  mainwc.lpszClassName = L"OpenHDRMain";
+  RegisterClassExW(&mainwc);
+  CreateWindowExW(0, L"OpenHDRMain", L"OpenHDRMain", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, inst, nullptr);
 
   winrt::init_apartment(winrt::apartment_type::multi_threaded);
   load_settings();
@@ -823,47 +1295,74 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   uiw.lpszClassName = L"OpenHDRSettings";
   RegisterClassExW(&uiw);
 
-  g_overlay = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT, wc.lpszClassName,
-                              L"OpenHDR", WS_POPUP, 0, 0, 64, 64, nullptr, nullptr, inst, nullptr);
-  g_ui = CreateWindowExW(WS_EX_APPWINDOW, uiw.lpszClassName, L"OpenHDR Settings",
-                         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, 80, 80, 540, 490,
-                         nullptr, nullptr, inst, nullptr);
-  RegisterHotKey(g_ui, 1, MOD_ALT | MOD_NOREPEAT, 'X');
-  SetWindowsHookExW(WH_KEYBOARD_LL, llkb, inst, 0);
-  show_settings();
+  g_overlay = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_NOREDIRECTIONBITMAP,
+                              wc.lpszClassName, L"OpenHDR", WS_POPUP, 0, 0, 64, 64, nullptr, nullptr, inst, nullptr);
+  SetWindowDisplayAffinity(g_overlay, WDA_EXCLUDEFROMCAPTURE);
+  set_clickthrough(true);
+  g_present_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  g_present_run.store(true);
+  g_present_th = CreateThread(nullptr, 0, present_thread, nullptr, 0, nullptr);
+  if (g_present_th) SetThreadPriority(g_present_th, THREAD_PRIORITY_ABOVE_NORMAL);
+  g_ui = CreateWindowExW(WS_EX_APPWINDOW, uiw.lpszClassName, L"OpenHDR",
+                         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, 80, 80, 540, 490, nullptr, nullptr,
+                         inst, nullptr);
+  ensure_hook(inst);
+  if (!background) {
+    g_host = GetForegroundWindow();
+    show_settings();
+  }
 
   MSG msg{};
+  HWND last_fg = nullptr;
+  ULONGLONG last_scan = 0;
   for (;;) {
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-      if (msg.message == WM_QUIT) return 0;
+      if (msg.message == WM_QUIT) {
+        g_present_run.store(false);
+        if (g_present_stop) SetEvent(g_present_stop);
+        if (g_present_th) {
+          WaitForSingleObject(g_present_th, 1000);
+          CloseHandle(g_present_th);
+          g_present_th = nullptr;
+        }
+        return 0;
+      }
       TranslateMessage(&msg);
       DispatchMessageW(&msg);
     }
-    if (g_alt_x.exchange(false)) on_hotkey();
-
+    if (WaitForSingleObject(toggle_event(), 0) == WAIT_OBJECT_0) apply_toggle();
     HWND fg = GetForegroundWindow();
-    if (g_target && !IsWindow(g_target)) {
-      stop_capture();
-      g_target = nullptr;
-      g_target_name[0] = 0;
-      g_placed = {};
-      show_settings();
+    ULONGLONG now = GetTickCount64();
+    if (g_last_game && !IsWindow(g_last_game)) g_last_game = nullptr;
+    if (g_target && !target_alive(g_target)) detach();
+    if (fg != last_fg || now - last_scan >= 250) {
+      last_fg = fg;
+      last_scan = now;
+      HWND game = window_for_host(fg);
+      if (game && target_alive(game)) {
+        g_last_game = game;
+        g_attach_fail = nullptr;
+        try_attach(game);
+      }
+      if (g_target && !target_alive(g_target)) detach();
     }
-    if (!g_target) {
-      Sleep(16);
+    if (!g_set.enabled || !g_target) {
+      g_allow_present.store(false);
+      hide_overlay();
+      HANDLE idle = toggle_event();
+      MsgWaitForMultipleObjects(1, &idle, FALSE, 16, QS_ALLINPUT);
       continue;
     }
-    if (IsIconic(g_target) || (fg != g_target && fg != g_overlay && fg != g_ui)) {
-      ShowWindow(g_overlay, SW_HIDE);
-      Sleep(16);
+    if (fg != g_target && fg != g_overlay && fg != g_ui) {
+      g_allow_present.store(false);
+      hide_overlay();
+      HANDLE idle = toggle_event();
+      MsgWaitForMultipleObjects(1, &idle, FALSE, 16, QS_ALLINPUT);
       continue;
     }
-    if (ID3D11Texture2D *tex = frame_tex()) {
-      D3D11_TEXTURE2D_DESC td{};
-      tex->GetDesc(&td);
-      place_overlay(g_target, td.Width, td.Height);
-      map_frame(tex);
-      tex->Release();
-    }
+    g_allow_present.store(true);
+    if (g_frame_tick.load() && now - g_frame_tick.load() > 250) hide_overlay();
+    HANDLE evs[2] = {toggle_event(), frame_event()};
+    MsgWaitForMultipleObjects(2, evs, FALSE, 16, QS_ALLINPUT);
   }
 }
