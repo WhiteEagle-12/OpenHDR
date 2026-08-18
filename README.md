@@ -26,15 +26,22 @@ Output: `bin\Release\OpenHDR.exe` plus `lut3d_49.bin` and `rtx_control_atlas.bin
 
 ## Use
 
-1. Run `OpenHDR.exe`.
-2. Focus a game.
-3. Press **Alt+X** for settings.
+1. Run `OpenHDR.exe`. A small settings window appears.
+2. Click the game so it is focused.
+3. Press **Alt+X** to attach. Press it again for settings.
+
+OpenHDR only attaches to the focused game (same idea as Lossless Scaling's
+scale hotkey). Browsers, Discord, Cursor, Explorer, and other desktop apps
+are ignored. The process is per-monitor DPI aware and the overlay is sized
+to the window's visible frame so the image is not stretched.
+
+If another app already owns Alt+X, OpenHDR reports that at startup.
 
 Settings are stored in `%LOCALAPPDATA%\OpenHDR\settings.ini`.
 
-The overlay stays click-through while the menu is closed, so it does not steal
-input. Use borderless / windowed mode. Exclusive fullscreen, DRM-protected
-frames, and some anti-cheat capture blocks will show black or no overlay.
+The overlay stays click-through while the menu is closed. Use borderless or
+windowed mode. Exclusive fullscreen, DRM-protected frames, and some
+anti-cheat capture blocks will show black or no overlay.
 
 Capture latency is about one to two display frames. The fused kernel on the
 present path is under 0.3 ms.
