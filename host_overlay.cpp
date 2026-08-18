@@ -167,7 +167,9 @@ static ID3D11ShaderResourceView *g_lut_srv = nullptr, *g_atlas_srv = nullptr;
 static ID3D11Texture2D *g_cap_tex[2] = {};
 static ID3D11ShaderResourceView *g_cap_srv[2] = {};
 static HWND g_overlay = nullptr;
+static HWND g_ui = nullptr;
 static HWND g_target = nullptr;
+static wchar_t g_target_name[64] = L"";
 static UINT g_w = 0, g_h = 0;
 static RECT g_placed{};
 static int g_pool_w = 0, g_pool_h = 0;
@@ -177,6 +179,15 @@ static bool g_has_atlas = false;
 static bool g_cb_dirty = true;
 static float g_sat_scales[9] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
 static std::atomic<bool> g_alt_x{false};
+static std::atomic<ULONGLONG> g_hotkey_at{0};
+
+static void arm_hotkey() {
+  ULONGLONG now = GetTickCount64();
+  ULONGLONG prev = g_hotkey_at.load();
+  if (now - prev < 300) return;
+  g_hotkey_at.store(now);
+  g_alt_x.store(true);
+}
 static IDirect3DDevice g_winrt_dev{nullptr};
 static GraphicsCaptureItem g_item{nullptr};
 static Direct3D11CaptureFramePool g_pool{nullptr};
@@ -254,29 +265,6 @@ static bool skip_exe(const wchar_t *name) {
   return false;
 }
 
-static bool has_game_gpu(DWORD pid) {
-  HANDLE p = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-  if (!p) return false;
-  HMODULE mods[256];
-  DWORD need = 0;
-  bool ok = false;
-  if (EnumProcessModules(p, mods, sizeof(mods), &need)) {
-    unsigned n = need / sizeof(HMODULE);
-    if (n > 256) n = 256;
-    wchar_t name[MAX_PATH];
-    for (unsigned i = 0; i < n; i++) {
-      if (!GetModuleBaseNameW(p, mods[i], name, MAX_PATH)) continue;
-      if (!_wcsicmp(name, L"d3d9.dll") || !_wcsicmp(name, L"d3d11.dll") || !_wcsicmp(name, L"d3d12.dll") ||
-          !_wcsicmp(name, L"vulkan-1.dll") || !_wcsicmp(name, L"opengl32.dll")) {
-        ok = true;
-        break;
-      }
-    }
-  }
-  CloseHandle(p);
-  return ok;
-}
-
 static bool is_cloaked(HWND hwnd) {
   int hidden = 0;
   return SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &hidden, sizeof(hidden))) && hidden != 0;
@@ -287,35 +275,45 @@ static bool window_frame(HWND hwnd, RECT *out) {
   return GetWindowRect(hwnd, out) != 0;
 }
 
-static HWND pick_target() {
-  HWND fg = GetForegroundWindow();
-  if (!fg || fg == g_overlay) return nullptr;
-  wchar_t cls[64]{};
-  GetClassNameW(fg, cls, 64);
-  if (!_wcsicmp(cls, L"OpenHDROverlay") || !_wcsicmp(cls, L"OpenHDRInstall")) return nullptr;
-  LONG style = GetWindowLongW(fg, GWL_STYLE);
-  LONG ex = GetWindowLongW(fg, GWL_EXSTYLE);
-  if (ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) return nullptr;
-  if (!(style & WS_VISIBLE) || (style & WS_DISABLED)) return nullptr;
+static bool exe_name(HWND hwnd, wchar_t *out, size_t outn) {
+  out[0] = 0;
   DWORD pid = 0;
-  GetWindowThreadProcessId(fg, &pid);
-  if (!pid || pid == GetCurrentProcessId()) return nullptr;
-  wchar_t path[MAX_PATH]{};
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (!pid) return false;
   HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-  if (p) {
-    DWORD n = MAX_PATH;
-    QueryFullProcessImageNameW(p, 0, path, &n);
-    CloseHandle(p);
-  }
+  if (!p) return false;
+  wchar_t path[MAX_PATH]{};
+  DWORD n = MAX_PATH;
+  BOOL ok = QueryFullProcessImageNameW(p, 0, path, &n);
+  CloseHandle(p);
+  if (!ok) return false;
   const wchar_t *base = path;
   for (wchar_t *c = path; *c; ++c)
     if (*c == L'\\' || *c == L'/') base = c + 1;
-  if (skip_exe(base)) return nullptr;
+  lstrcpynW(out, base, (int)outn);
+  return true;
+}
+
+static HWND pick_target() {
+  HWND fg = GetForegroundWindow();
+  if (!fg || fg == g_overlay || fg == g_ui) return nullptr;
+  wchar_t cls[64]{};
+  GetClassNameW(fg, cls, 64);
+  if (!_wcsicmp(cls, L"OpenHDROverlay") || !_wcsicmp(cls, L"OpenHDRSettings")) return nullptr;
+  LONG style = GetWindowLongW(fg, GWL_STYLE);
+  LONG ex = GetWindowLongW(fg, GWL_EXSTYLE);
+  if (ex & WS_EX_TOOLWINDOW) return nullptr;
+  if (!(style & WS_VISIBLE)) return nullptr;
+  DWORD pid = 0;
+  GetWindowThreadProcessId(fg, &pid);
+  if (!pid || pid == GetCurrentProcessId()) return nullptr;
+  wchar_t name[64]{};
+  exe_name(fg, name, 64);
+  if (name[0] && skip_exe(name)) return nullptr;
   RECT rc{};
   GetClientRect(fg, &rc);
   if ((rc.right - rc.left) < 640 || (rc.bottom - rc.top) < 360) return nullptr;
   if (!IsWindowVisible(fg) || IsIconic(fg) || is_cloaked(fg)) return nullptr;
-  if (!has_game_gpu(pid)) return nullptr;
   return fg;
 }
 
@@ -327,17 +325,18 @@ static void set_clickthrough(bool through) {
   SetWindowLongW(g_overlay, GWL_EXSTYLE, ex);
 }
 
-static void place_idle_menu() {
+static void place_ui() {
+  if (!g_ui) return;
   POINT cursor{};
   GetCursorPos(&cursor);
   HMONITOR mon = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
   MONITORINFO mi{sizeof(mi)};
   if (!GetMonitorInfoW(mon, &mi)) return;
-  constexpr int width = 560;
-  constexpr int height = 280;
-  int x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - width) / 2;
-  int y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - height) / 2;
-  SetWindowPos(g_overlay, HWND_NOTOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  constexpr int width = 420;
+  constexpr int height = 360;
+  int x = mi.rcWork.left + 48;
+  int y = mi.rcWork.top + 48;
+  SetWindowPos(g_ui, HWND_TOPMOST, x, y, width, height, SWP_SHOWWINDOW);
 }
 
 static void place_overlay(HWND target, UINT capture_width, UINT capture_height) {
@@ -597,18 +596,21 @@ static void draw_menu(HDC dc, int w, int h) {
     TextOutW(dc, 28, y, line, (int)wcslen(line));
     y += 28;
   };
-  TextOutW(dc, 28, y, g_set.enabled ? L"OpenHDR  ON   (desktop overlay)" : L"OpenHDR  OFF  (desktop overlay)", -1);
-  y += 32;
-  if (!g_target) {
-    TextOutW(dc, 28, y, L"Focus a game, then Alt+X. Desktop apps are ignored.", -1);
-    y += 32;
+  TextOutW(dc, 28, y, g_set.enabled ? L"OpenHDR  ON" : L"OpenHDR  OFF", (int)wcslen(g_set.enabled ? L"OpenHDR  ON" : L"OpenHDR  OFF"));
+  y += 28;
+  if (g_target_name[0]) {
+    swprintf_s(line, L"Attached  %s", g_target_name);
+    TextOutW(dc, 28, y, line, (int)wcslen(line));
+  } else {
+    TextOutW(dc, 28, y, L"Not attached. Focus a game, Alt+X.", 34);
   }
+  y += 32;
   row(L"Peak", g_set.peak);
   row(L"Paper white", g_set.paper);
   row(L"Contrast", g_set.contrast);
   row(L"Saturation", g_set.sat);
   row(L"Deband %", g_set.deband * 100);
-  TextOutW(dc, 28, y + 8, L"Alt+X close   arrows change   1 2 3 4 5 = sliders", -1);
+  TextOutW(dc, 28, y + 8, L"Alt+X hide    1 on/off    arrows change", 38);
 }
 
 static void handle_menu_keys() {
@@ -648,19 +650,48 @@ static void handle_menu_keys() {
 static LRESULT CALLBACK overlay_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   if (msg == WM_DESTROY) PostQuitMessage(0);
   if (msg == WM_HOTKEY && wp == 1) {
-    g_alt_x = true;
+    arm_hotkey();
     return 0;
   }
-  if (msg == WM_PAINT && g_menu) {
+  return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static LRESULT CALLBACK ui_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+  if (msg == WM_CLOSE) {
+    g_menu = false;
+    save_settings();
+    ShowWindow(hwnd, SW_HIDE);
+    return 0;
+  }
+  if (msg == WM_HOTKEY && wp == 1) {
+    arm_hotkey();
+    return 0;
+  }
+  if (msg == WM_PAINT) {
     PAINTSTRUCT ps{};
     HDC dc = BeginPaint(hwnd, &ps);
     RECT rc{};
     GetClientRect(hwnd, &rc);
+    HBRUSH bg = CreateSolidBrush(RGB(16, 16, 18));
+    FillRect(dc, &rc, bg);
+    DeleteObject(bg);
     draw_menu(dc, rc.right, rc.bottom);
     EndPaint(hwnd, &ps);
     return 0;
   }
   return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static LRESULT CALLBACK llkb(int code, WPARAM wp, LPARAM lp) {
+  if (code == HC_ACTION && (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN)) {
+    auto *k = reinterpret_cast<KBDLLHOOKSTRUCT *>(lp);
+    if (k && k->vkCode == 'X' && (GetAsyncKeyState(VK_MENU) & 0x8000)) {
+      arm_hotkey();
+      if (g_ui) PostMessageW(g_ui, WM_APP, 0, 0);
+      return 1;
+    }
+  }
+  return CallNextHookEx(nullptr, code, wp, lp);
 }
 
 static bool init_gpu() {
@@ -713,21 +744,44 @@ static bool init_gpu() {
 }
 
 static void show_settings() {
-  if (!g_overlay) return;
-  LONG ex = GetWindowLongW(g_overlay, GWL_EXSTYLE);
-  ex &= ~(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
-  ex |= WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
-  SetWindowLongW(g_overlay, GWL_EXSTYLE, ex);
   g_menu = true;
-  set_clickthrough(false);
-  place_idle_menu();
-  InvalidateRect(g_overlay, nullptr, TRUE);
+  place_ui();
+  InvalidateRect(g_ui, nullptr, TRUE);
+  SetForegroundWindow(g_ui);
+}
+
+static void hide_settings() {
+  g_menu = false;
+  save_settings();
+  if (g_ui) ShowWindow(g_ui, SW_HIDE);
+}
+
+static void on_hotkey() {
+  HWND target = pick_target();
+  if (target && target != g_target) {
+    if (start_capture(target)) {
+      g_target = target;
+      g_placed = {};
+      exe_name(target, g_target_name, 64);
+      set_clickthrough(true);
+    }
+  }
+  if (g_menu) hide_settings();
+  else show_settings();
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\OpenHDR_desktop_overlay");
-  if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+  if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    HWND existing = FindWindowW(L"OpenHDRSettings", nullptr);
+    if (existing) {
+      ShowWindow(existing, SW_SHOW);
+      SetForegroundWindow(existing);
+      PostMessageW(existing, WM_HOTKEY, 1, 0);
+    }
+    return 0;
+  }
 
   winrt::init_apartment(winrt::apartment_type::multi_threaded);
   load_settings();
@@ -742,59 +796,49 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
   wc.lpszClassName = L"OpenHDROverlay";
   RegisterClassExW(&wc);
-  g_overlay = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, wc.lpszClassName, L"OpenHDR", WS_POPUP, 0, 0, 64, 64,
-                              nullptr, nullptr, inst, nullptr);
-  if (!RegisterHotKey(g_overlay, 1, MOD_ALT | MOD_NOREPEAT, 'X')) {
-    MessageBoxW(nullptr, L"OpenHDR could not register Alt+X. Close the other app using that shortcut, then start OpenHDR again.",
-                L"OpenHDR hotkey unavailable", MB_ICONERROR);
-    return 2;
-  }
+  WNDCLASSEXW uiw{sizeof(uiw)};
+  uiw.lpfnWndProc = ui_proc;
+  uiw.hInstance = inst;
+  uiw.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+  uiw.hbrBackground = CreateSolidBrush(RGB(16, 16, 18));
+  uiw.lpszClassName = L"OpenHDRSettings";
+  RegisterClassExW(&uiw);
+
+  g_overlay = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT, wc.lpszClassName,
+                              L"OpenHDR", WS_POPUP, 0, 0, 64, 64, nullptr, nullptr, inst, nullptr);
+  g_ui = CreateWindowExW(WS_EX_TOPMOST | WS_EX_APPWINDOW, uiw.lpszClassName, L"OpenHDR",
+                         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, 80, 80, 420, 360, nullptr, nullptr, inst, nullptr);
+  RegisterHotKey(g_ui, 1, MOD_ALT | MOD_NOREPEAT, 'X');
+  RegisterHotKey(g_overlay, 1, MOD_ALT | MOD_NOREPEAT, 'X');
+  SetWindowsHookExW(WH_KEYBOARD_LL, llkb, inst, 0);
   show_settings();
 
   MSG msg{};
   for (;;) {
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
       if (msg.message == WM_QUIT) return 0;
+      if (msg.message == WM_APP) arm_hotkey();
       TranslateMessage(&msg);
       DispatchMessageW(&msg);
     }
-    if (g_alt_x.exchange(false)) {
-      HWND fg = GetForegroundWindow();
-      HWND target = pick_target();
-      if (target && target != g_target) {
-        if (start_capture(target)) {
-          g_target = target;
-          g_placed = {};
-          g_menu = false;
-          set_clickthrough(true);
-        } else {
-          show_settings();
-        }
-      } else if (!g_target) {
-        show_settings();
-      } else if (fg == g_target || fg == g_overlay) {
-        g_menu = !g_menu;
-        set_clickthrough(!g_menu);
-        if (!g_menu) save_settings();
-      }
-      InvalidateRect(g_overlay, nullptr, TRUE);
-    }
+    if (g_alt_x.exchange(false)) on_hotkey();
     if (g_menu) handle_menu_keys();
 
     HWND fg = GetForegroundWindow();
     if (g_target && !IsWindow(g_target)) {
       stop_capture();
       g_target = nullptr;
+      g_target_name[0] = 0;
       g_placed = {};
       show_settings();
     }
     if (!g_target) {
-      Sleep(50);
+      Sleep(16);
       continue;
     }
-    if (IsIconic(g_target) || (fg != g_target && fg != g_overlay)) {
+    if (IsIconic(g_target) || (fg != g_target && fg != g_overlay && fg != g_ui)) {
       ShowWindow(g_overlay, SW_HIDE);
-      Sleep(50);
+      Sleep(16);
       continue;
     }
     if (ID3D11Texture2D *tex = frame_tex()) {
@@ -804,12 +848,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
       map_frame(tex);
       tex->Release();
     }
-    if (g_menu) {
-      HDC dc = GetDC(g_overlay);
-      RECT rc{};
-      GetClientRect(g_overlay, &rc);
-      draw_menu(dc, rc.right, rc.bottom);
-      ReleaseDC(g_overlay, dc);
-    }
+    if (g_menu) InvalidateRect(g_ui, nullptr, FALSE);
   }
 }
