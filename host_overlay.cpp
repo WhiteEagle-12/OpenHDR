@@ -156,18 +156,21 @@ void main(uint3 id : SV_DispatchThreadID) {
 static ID3D11Device *g_dev = nullptr;
 static ID3D11DeviceContext *g_ctx = nullptr;
 static IDXGISwapChain3 *g_swap = nullptr;
-static ID3D11Texture2D *g_hdr = nullptr;
-static ID3D11UnorderedAccessView *g_hdr_uav = nullptr;
+static ID3D11Texture2D *g_bb_tex[2] = {};
+static ID3D11UnorderedAccessView *g_bb_uav[2] = {};
 static ID3D11ComputeShader *g_cs = nullptr;
 static ID3D11Buffer *g_lut = nullptr, *g_atlas = nullptr, *g_cb = nullptr;
-static ID3D11ShaderResourceView *g_lut_srv = nullptr, *g_atlas_srv = nullptr, *g_src_srv = nullptr;
-static ID3D11Texture2D *g_src = nullptr;
+static ID3D11ShaderResourceView *g_lut_srv = nullptr, *g_atlas_srv = nullptr;
+static ID3D11Texture2D *g_cap_tex[2] = {};
+static ID3D11ShaderResourceView *g_cap_srv[2] = {};
 static HWND g_overlay = nullptr;
 static HWND g_target = nullptr;
 static UINT g_w = 0, g_h = 0;
+static RECT g_placed{};
 static Settings g_set{};
 static bool g_menu = false;
 static bool g_has_atlas = false;
+static bool g_cb_dirty = true;
 static float g_sat_scales[9] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
 static std::atomic<bool> g_alt_x{false};
 static IDirect3DDevice g_winrt_dev{nullptr};
@@ -306,48 +309,67 @@ static void place_overlay(HWND target) {
   GetClientRect(target, &cr);
   POINT tl{0, 0};
   ClientToScreen(target, &tl);
-  int w = cr.right - cr.left, h = cr.bottom - cr.top;
-  SetWindowPos(g_overlay, HWND_TOPMOST, tl.x, tl.y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  RECT want{tl.x, tl.y, tl.x + (cr.right - cr.left), tl.y + (cr.bottom - cr.top)};
+  if (want.left == g_placed.left && want.top == g_placed.top && want.right == g_placed.right && want.bottom == g_placed.bottom)
+    return;
+  g_placed = want;
+  SetWindowPos(g_overlay, HWND_TOPMOST, want.left, want.top, want.right - want.left, want.bottom - want.top,
+               SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
-static void release_src() {
-  if (g_src_srv) {
-    g_src_srv->Release();
-    g_src_srv = nullptr;
-  }
-  if (g_src) {
-    g_src->Release();
-    g_src = nullptr;
-  }
-}
-
-static void release_hdr() {
-  if (g_hdr_uav) {
-    g_hdr_uav->Release();
-    g_hdr_uav = nullptr;
-  }
-  if (g_hdr) {
-    g_hdr->Release();
-    g_hdr = nullptr;
+static void release_caps() {
+  for (int i = 0; i < 2; i++) {
+    if (g_cap_srv[i]) {
+      g_cap_srv[i]->Release();
+      g_cap_srv[i] = nullptr;
+    }
+    g_cap_tex[i] = nullptr;
   }
 }
 
-static bool ensure_hdr(UINT w, UINT h) {
-  if (g_hdr && g_w == w && g_h == h) return true;
-  release_hdr();
-  g_w = w;
-  g_h = h;
-  D3D11_TEXTURE2D_DESC td{};
-  td.Width = w;
-  td.Height = h;
-  td.MipLevels = 1;
-  td.ArraySize = 1;
-  td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-  td.SampleDesc.Count = 1;
-  td.Usage = D3D11_USAGE_DEFAULT;
-  td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
-  if (FAILED(g_dev->CreateTexture2D(&td, nullptr, &g_hdr))) return false;
-  return SUCCEEDED(g_dev->CreateUnorderedAccessView(g_hdr, nullptr, &g_hdr_uav));
+static void release_bb() {
+  for (int i = 0; i < 2; i++) {
+    if (g_bb_uav[i]) {
+      g_bb_uav[i]->Release();
+      g_bb_uav[i] = nullptr;
+    }
+    g_bb_tex[i] = nullptr;
+  }
+}
+
+static ID3D11UnorderedAccessView *uav_for_backbuffer() {
+  if (!g_swap) return nullptr;
+  ID3D11Texture2D *bb = nullptr;
+  if (FAILED(g_swap->GetBuffer(0, IID_PPV_ARGS(&bb))) || !bb) return nullptr;
+  for (int i = 0; i < 2; i++) {
+    if (g_bb_tex[i] == bb) {
+      bb->Release();
+      return g_bb_uav[i];
+    }
+  }
+  int slot = g_bb_uav[0] ? 1 : 0;
+  if (g_bb_uav[slot]) {
+    g_bb_uav[slot]->Release();
+    g_bb_uav[slot] = nullptr;
+  }
+  g_bb_tex[slot] = bb;
+  g_dev->CreateUnorderedAccessView(bb, nullptr, &g_bb_uav[slot]);
+  bb->Release();
+  return g_bb_uav[slot];
+}
+
+static ID3D11ShaderResourceView *srv_for_cap(ID3D11Texture2D *tex) {
+  for (int i = 0; i < 2; i++) {
+    if (g_cap_tex[i] == tex) return g_cap_srv[i];
+  }
+  int slot = g_cap_srv[0] ? 1 : 0;
+  if (g_cap_srv[slot]) {
+    g_cap_srv[slot]->Release();
+    g_cap_srv[slot] = nullptr;
+  }
+  g_cap_tex[slot] = tex;
+  g_dev->CreateShaderResourceView(tex, nullptr, &g_cap_srv[slot]);
+  return g_cap_srv[slot];
 }
 
 static bool ensure_swapchain(UINT w, UINT h) {
@@ -355,7 +377,11 @@ static bool ensure_swapchain(UINT w, UINT h) {
     DXGI_SWAP_CHAIN_DESC sd{};
     g_swap->GetDesc(&sd);
     if (sd.BufferDesc.Width == w && sd.BufferDesc.Height == h) return true;
-    g_swap->ResizeBuffers(0, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
+    release_bb();
+    if (FAILED(g_swap->ResizeBuffers(0, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING))) return false;
+    g_w = w;
+    g_h = h;
+    g_cb_dirty = true;
     return true;
   }
   IDXGIDevice *dxgi_dev = nullptr;
@@ -382,6 +408,8 @@ static bool ensure_swapchain(UINT w, UINT h) {
   sc1->QueryInterface(&g_swap);
   sc1->Release();
   g_swap->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
+  g_w = w;
+  g_h = h;
   return true;
 }
 
@@ -397,7 +425,7 @@ static void stop_capture() {
   g_session = nullptr;
   g_pool = nullptr;
   g_item = nullptr;
-  release_src();
+  release_caps();
 }
 
 static IDirect3DDevice wrap_device(ID3D11Device *dev) {
@@ -451,54 +479,48 @@ static ID3D11Texture2D *frame_tex() {
   return tex;
 }
 
+static void write_cb(UINT w, UINT h) {
+  D3D11_MAPPED_SUBRESOURCE mapped{};
+  if (FAILED(g_ctx->Map(g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return;
+  CB cb{};
+  cb.width = w;
+  cb.height = h;
+  cb.n = kN;
+  cb.flags = (g_set.enabled ? 1u : 0u) | (g_has_atlas ? 2u : 0u);
+  cb.peakNits = g_set.peak;
+  cb.grayNits = g_set.paper;
+  cb.contrast = g_set.contrast;
+  cb.saturation = g_set.sat;
+  cb.satScale = sat_scale(g_set.sat);
+  cb.debandStrength = g_set.deband;
+  cb.debandRadius = 16;
+  cb.debandThresh = 0.003f;
+  cb.blackFloor = 0.02f;
+  cb.uiWhite = kUiWhiteScRgb;
+  memcpy(mapped.pData, &cb, sizeof(cb));
+  g_ctx->Unmap(g_cb, 0);
+  g_cb_dirty = false;
+}
+
 static void map_frame(ID3D11Texture2D *cap) {
   D3D11_TEXTURE2D_DESC td{};
   cap->GetDesc(&td);
-  if (!ensure_hdr(td.Width, td.Height) || !ensure_swapchain(td.Width, td.Height)) return;
-  if (g_src_srv) {
-    g_src_srv->Release();
-    g_src_srv = nullptr;
-  }
-  g_dev->CreateShaderResourceView(cap, nullptr, &g_src_srv);
-  if (!g_src_srv) return;
+  if (!ensure_swapchain(td.Width, td.Height)) return;
+  ID3D11UnorderedAccessView *uav = uav_for_backbuffer();
+  ID3D11ShaderResourceView *src = srv_for_cap(cap);
+  if (!uav || !src) return;
+  if (g_cb_dirty) write_cb(td.Width, td.Height);
 
-  D3D11_MAPPED_SUBRESOURCE mapped{};
-  if (SUCCEEDED(g_ctx->Map(g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-    CB cb{};
-    cb.width = td.Width;
-    cb.height = td.Height;
-    cb.n = kN;
-    cb.flags = (g_set.enabled ? 1u : 0u) | (g_has_atlas ? 2u : 0u);
-    cb.peakNits = g_set.peak;
-    cb.grayNits = g_set.paper;
-    cb.contrast = g_set.contrast;
-    cb.saturation = g_set.sat;
-    cb.satScale = sat_scale(g_set.sat);
-    cb.debandStrength = g_set.deband;
-    cb.debandRadius = 16;
-    cb.debandThresh = 0.003f;
-    cb.blackFloor = 0.02f;
-    cb.uiWhite = kUiWhiteScRgb;
-    memcpy(mapped.pData, &cb, sizeof(cb));
-    g_ctx->Unmap(g_cb, 0);
-  }
-  ID3D11ShaderResourceView *srvs[3] = {g_lut_srv, g_src_srv, g_atlas_srv};
+  ID3D11ShaderResourceView *srvs[3] = {g_lut_srv, src, g_atlas_srv};
   g_ctx->CSSetShader(g_cs, nullptr, 0);
   g_ctx->CSSetConstantBuffers(0, 1, &g_cb);
   g_ctx->CSSetShaderResources(0, 3, srvs);
-  g_ctx->CSSetUnorderedAccessViews(0, 1, &g_hdr_uav, nullptr);
+  g_ctx->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
   g_ctx->Dispatch((td.Width + 7) / 8, (td.Height + 7) / 8, 1);
   ID3D11UnorderedAccessView *noneU = nullptr;
   ID3D11ShaderResourceView *noneS[3] = {};
   g_ctx->CSSetUnorderedAccessViews(0, 1, &noneU, nullptr);
   g_ctx->CSSetShaderResources(0, 3, noneS);
-
-  ID3D11Texture2D *bb = nullptr;
-  g_swap->GetBuffer(0, IID_PPV_ARGS(&bb));
-  if (bb) {
-    g_ctx->CopyResource(bb, g_hdr);
-    bb->Release();
-  }
   g_swap->Present(0, DXGI_PRESENT_ALLOW_TEARING);
 }
 
@@ -535,7 +557,10 @@ static void handle_menu_keys() {
     if (g_menu) {
     }
   }
-  if (GetAsyncKeyState('1') & 1) g_set.enabled = !g_set.enabled;
+  if (GetAsyncKeyState('1') & 1) {
+    g_set.enabled = !g_set.enabled;
+    g_cb_dirty = true;
+  }
   if (GetAsyncKeyState(VK_LEFT) & 1) {
     if (GetAsyncKeyState('2') & 0x8000) g_set.peak = std::max(400.0f, g_set.peak - step);
     else if (GetAsyncKeyState('3') & 0x8000) g_set.paper = std::max(10.0f, g_set.paper - step);
@@ -543,6 +568,7 @@ static void handle_menu_keys() {
     else if (GetAsyncKeyState('5') & 0x8000) g_set.sat = std::max(0.0f, g_set.sat - step);
     else if (GetAsyncKeyState('6') & 0x8000) g_set.deband = std::max(0.0f, g_set.deband - step / 100.0f);
     else g_set.peak = std::max(400.0f, g_set.peak - step);
+    g_cb_dirty = true;
     save_settings();
   }
   if (GetAsyncKeyState(VK_RIGHT) & 1) {
@@ -551,6 +577,7 @@ static void handle_menu_keys() {
     else if (GetAsyncKeyState('5') & 0x8000) g_set.sat = std::min(200.0f, g_set.sat + step);
     else if (GetAsyncKeyState('6') & 0x8000) g_set.deband = std::min(1.0f, g_set.deband + step / 100.0f);
     else g_set.peak = std::min(2000.0f, g_set.peak + step);
+    g_cb_dirty = true;
     save_settings();
   }
 }
@@ -668,24 +695,29 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
       if (!g_menu) save_settings();
       InvalidateRect(g_overlay, nullptr, TRUE);
     }
-    handle_menu_keys();
+    if (g_menu) handle_menu_keys();
 
-    HWND t = pick_target();
-    if (!t) {
-      if (g_target) {
-        stop_capture();
-        g_target = nullptr;
-        ShowWindow(g_overlay, SW_HIDE);
-      }
-      Sleep(50);
-      continue;
-    }
-    if (t != g_target) {
-      g_target = t;
-      if (!start_capture(t)) {
-        g_target = nullptr;
-        Sleep(200);
+    HWND fg = GetForegroundWindow();
+    bool locked = g_target && IsWindow(g_target) && !IsIconic(g_target) && (fg == g_target || fg == g_overlay);
+    if (!locked) {
+      HWND t = pick_target();
+      if (!t) {
+        if (g_target) {
+          stop_capture();
+          g_target = nullptr;
+          g_placed = {};
+          ShowWindow(g_overlay, SW_HIDE);
+        }
+        Sleep(50);
         continue;
+      }
+      if (t != g_target) {
+        g_target = t;
+        if (!start_capture(t)) {
+          g_target = nullptr;
+          Sleep(200);
+          continue;
+        }
       }
     }
     place_overlay(g_target);
