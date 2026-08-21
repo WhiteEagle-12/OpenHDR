@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+for _attempt in {1..100}; do
+  if gamescopectl openhdr_enabled "$OPENHDR_ENABLED" >/dev/null 2>&1; then
+    # A nested Gamescope can directly scan out a single game surface to the
+    # parent compositor. That path skips Gamescope's composite shader,
+    # including its shaper/3D LUT, so OpenHDR would appear to do nothing when
+    # the menu was closed. Keep this dedicated instance on the composition
+    # path in active and bypass modes; the switch then changes the transform
+    # without also changing the presentation path.
+    gamescopectl composite_force 1 >/dev/null 2>&1 || continue
+    if [[ $OPENHDR_ENABLED == 1 ]]; then
+      gamescopectl set_look "$OPENHDR_LOOK" >/dev/null 2>&1 || continue
+      echo "OpenHDR: loaded 49^3 LUT $(basename "$OPENHDR_LOOK")" >&2
+    else
+      gamescopectl set_look >/dev/null 2>&1 || true
+      echo "OpenHDR: processing starts disabled; press Alt+X to enable it or Alt+Z for settings" >&2
+    fi
+    gamescopectl openhdr_deband_strength "$(awk -v value="$OPENHDR_DEBAND_STRENGTH" 'BEGIN { print value / 100 }')" >/dev/null 2>&1 || true
+    gamescopectl openhdr_deband_radius "$OPENHDR_DEBAND_RADIUS" >/dev/null 2>&1 || true
+    gamescopectl openhdr_deband_threshold "$(awk -v value="$OPENHDR_DEBAND_THRESHOLD" 'BEGIN { print value / 1000 }')" >/dev/null 2>&1 || true
+    if [[ $OPENHDR_DITHERING == 1 ]]; then
+      gamescopectl openhdr_dither_strength "$(awk -v value="$OPENHDR_DITHER_STRENGTH" 'BEGIN { print value / 100 }')" >/dev/null 2>&1 || true
+    else
+      gamescopectl openhdr_dither_strength 0 >/dev/null 2>&1 || true
+    fi
+    menu_pid=
+    if [[ -x ${OPENHDR_MENU:-} ]]; then
+      "$OPENHDR_MENU" &
+      menu_pid=$!
+    else
+      echo "OpenHDR: menu binary is unavailable; processing remains active without Alt+Z controls" >&2
+    fi
+
+    game_pid=
+    stop_children() {
+      if [[ -n ${game_pid:-} ]] && kill -0 "$game_pid" 2>/dev/null; then
+        kill -TERM "$game_pid" 2>/dev/null || true
+      fi
+      if [[ -n ${menu_pid:-} ]] && kill -0 "$menu_pid" 2>/dev/null; then
+        kill -TERM "$menu_pid" 2>/dev/null || true
+        wait "$menu_pid" 2>/dev/null || true
+      fi
+    }
+    trap stop_children EXIT INT TERM HUP
+
+    "$@" &
+    game_pid=$!
+    set +e
+    wait "$game_pid"
+    game_status=$?
+    set -e
+    game_pid=
+
+    if [[ -n ${menu_pid:-} ]] && kill -0 "$menu_pid" 2>/dev/null; then
+      kill -TERM "$menu_pid" 2>/dev/null || true
+      wait "$menu_pid" 2>/dev/null || true
+      menu_pid=
+      # Ensure Gamescope has observed the Wayland/X11 client disconnect before
+      # its primary child exits and compositor teardown begins.
+      gamescopectl openhdr_enabled "$OPENHDR_ENABLED" >/dev/null 2>&1 || true
+    fi
+    trap - EXIT INT TERM HUP
+    exit "$game_status"
+  fi
+  sleep 0.02
+done
+
+echo "OpenHDR: Gamescope did not accept the generated LUT." >&2
+exit 1

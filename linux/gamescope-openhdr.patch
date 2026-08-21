@@ -1,0 +1,447 @@
+diff --git a/src/color_helpers.cpp b/src/color_helpers.cpp
+index 64430a5..74958b1 100644
+--- a/src/color_helpers.cpp
++++ b/src/color_helpers.cpp
+@@ -778,13 +778,31 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
+                 {
+                     glm::vec3 sourceColorEOTFEncoded = glm::vec3( vSourceColorEOTFEncodedEdge[nRed].r, vSourceColorEOTFEncodedEdge[nGreen].g, vSourceColorEOTFEncodedEdge[nBlue].b );
+ 
+-                    if ( pLook && !pLook->data.empty() )
++                    const bool bApplyLook = pLook && !pLook->data.empty();
++                    const float flSourceG22Luminance = bApplyLook && sourceEOTF == EOTF_Gamma22
++                        ? 2000.0f
++                        : tonemapping.g22_luminance;
++                    if ( bApplyLook )
+                     {
+-                        sourceColorEOTFEncoded = ApplyLut3D_Tetrahedral( *pLook, sourceColorEOTFEncoded );
++                        sourceColorEOTFEncoded = ApplyLut3D_Trilinear( *pLook, sourceColorEOTFEncoded );
+                     }
+ 
+                     // Convert to linearized display referred for source colorimetry
+-                    glm::vec3 sourceColorLinear = calcEOTFToLinear( sourceColorEOTFEncoded, sourceEOTF, tonemapping );
++                    // A Gamma-2.2 look may use signed values to carry linear scRGB
++                    // components outside the source gamut. glm::pow on a negative
++                    // base is undefined, so restore the sign explicitly. Ordinary
++                    // non-negative Gamescope looks are bit-for-bit equivalent.
++                    glm::vec3 sourceColorLinear;
++                    if ( bApplyLook && sourceEOTF == EOTF_Gamma22 )
++                    {
++                        sourceColorLinear = glm::sign( sourceColorEOTFEncoded )
++                            * glm::pow( glm::abs( sourceColorEOTFEncoded ), glm::vec3( 2.2f ) )
++                            * flSourceG22Luminance;
++                    }
++                    else
++                    {
++                        sourceColorLinear = calcEOTFToLinear( sourceColorEOTFEncoded, sourceEOTF, tonemapping );
++                    }
+ 
+                     // Convert to dest colorimetry (linearized display referred)
+                     glm::vec3 destColorLinear = dest_from_source * sourceColorLinear;
+@@ -810,10 +828,10 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
+                     {
+                         float flMax = std::max( std::max( destColorLinear.r, destColorLinear.g ), destColorLinear.b );
+                         // TODO: Don't use g22_luminance here or in tonemapping, use whatever maxContentLightLevel is for the connector.
+-                        if ( flMax > tonemapping.g22_luminance + 1.0f )
++                        if ( flMax > flSourceG22Luminance + 1.0f )
+                         {
+                             destColorLinear /= flMax;
+-                            destColorLinear *= tonemapping.g22_luminance;
++                            destColorLinear *= flSourceG22Luminance;
+                         }
+                     }
+ 
+diff --git a/src/color_helpers_impl.h b/src/color_helpers_impl.h
+index 3e8c2d5..83ad5c7 100644
+--- a/src/color_helpers_impl.h
++++ b/src/color_helpers_impl.h
+@@ -2,7 +2,7 @@
+ #include "color_helpers.h"
+ 
+ namespace rendervulkan {
+-  static constexpr uint32_t s_nLutEdgeSize3d = 17;
++  static constexpr uint32_t s_nLutEdgeSize3d = 49;
+   static constexpr uint32_t s_nLutSize1d = 4096;
+ }
+ 
+diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
+index aefc6b2..55ec55f 100644
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -1755,9 +1755,6 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
+ 		SamplerState linearState;
+ 		linearState.bNearest = false;
+ 		linearState.bUnnormalized = false;
+-		SamplerState nearestState; // TODO(Josh): Probably want to do this when I bring in tetrahedral interpolation.
+-		nearestState.bNearest = true;
+-		nearestState.bUnnormalized = false;
+ 
+ 		shaperLutDescriptor[i].sampler = m_device->sampler(linearState);
+ 		shaperLutDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+@@ -1765,7 +1762,7 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
+ 		// I need to change this, it's so utterly stupid and confusing.
+ 		shaperLutDescriptor[i].imageView = m_shaperLut[i] ? m_shaperLut[i]->srgbView() : VK_NULL_HANDLE;
+ 
+-		lut3DDescriptor[i].sampler = m_device->sampler(nearestState);
++		lut3DDescriptor[i].sampler = m_device->sampler(linearState);
+ 		lut3DDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+ 		lut3DDescriptor[i].imageView = m_lut3D[i] ? m_lut3D[i]->srgbView() : VK_NULL_HANDLE;
+ 	}
+@@ -3684,6 +3681,14 @@ float g_flInternalDisplayBrightnessNits = 500.0f;
+ float g_flHDRItmSdrNits = 100.f;
+ float g_flHDRItmTargetNits = 1000.f;
+ 
++extern std::atomic<bool> hasRepaint;
++static auto openhdr_repaint = []( auto & ) { hasRepaint = true; };
++gamescope::ConVar<bool> cv_openhdr_enabled{ "openhdr_enabled", true, "Enable the OpenHDR layer-0 preprocessing stage", openhdr_repaint };
++gamescope::ConVar<float> cv_openhdr_deband_strength{ "openhdr_deband_strength", 1.0f, "OpenHDR deband blend, 0-1", openhdr_repaint };
++gamescope::ConVar<float> cv_openhdr_deband_radius{ "openhdr_deband_radius", 16.0f, "OpenHDR deband radius in source pixels", openhdr_repaint };
++gamescope::ConVar<float> cv_openhdr_deband_threshold{ "openhdr_deband_threshold", 0.003f, "OpenHDR edge threshold in normalized units", openhdr_repaint };
++gamescope::ConVar<float> cv_openhdr_dither_strength{ "openhdr_dither_strength", 1.0f, "OpenHDR TPDF dither strength, 0-1", openhdr_repaint };
++
+ #pragma pack(push, 1)
+ struct BlitPushData_t
+ {
+@@ -3703,6 +3708,12 @@ struct BlitPushData_t
+     float u_itmSdrNits; // unset
+     float u_itmTargetNits; // unset
+ 
++	uint32_t u_openhdrEnabled;
++	float u_openhdrDebandStrength;
++	float u_openhdrDebandRadius;
++	float u_openhdrDebandThreshold;
++	float u_openhdrDitherStrength;
++
+ 	explicit BlitPushData_t(const struct FrameInfo_t *frameInfo)
+ 	{
+ 		u_shaderFilter = 0;
+@@ -3743,6 +3754,11 @@ struct BlitPushData_t
+ 		u_nitsToLinear = 1.0f / g_flInternalDisplayBrightnessNits;
+ 		u_itmSdrNits = g_flHDRItmSdrNits;
+ 		u_itmTargetNits = g_flHDRItmTargetNits;
++		u_openhdrEnabled = cv_openhdr_enabled ? 1u : 0u;
++		u_openhdrDebandStrength = std::clamp( float( cv_openhdr_deband_strength ), 0.0f, 1.0f );
++		u_openhdrDebandRadius = std::clamp( float( cv_openhdr_deband_radius ), 1.0f, 32.0f );
++		u_openhdrDebandThreshold = std::clamp( float( cv_openhdr_deband_threshold ), 0.0f, 0.01f );
++		u_openhdrDitherStrength = std::clamp( float( cv_openhdr_dither_strength ), 0.0f, 1.0f );
+ 	}
+ 
+ 	explicit BlitPushData_t(float blit_scale) {
+@@ -3764,6 +3780,11 @@ struct BlitPushData_t
+ 		u_nitsToLinear = 1.0f / g_flInternalDisplayBrightnessNits;
+ 		u_itmSdrNits = g_flHDRItmSdrNits;
+ 		u_itmTargetNits = g_flHDRItmTargetNits;
++		u_openhdrEnabled = cv_openhdr_enabled ? 1u : 0u;
++		u_openhdrDebandStrength = std::clamp( float( cv_openhdr_deband_strength ), 0.0f, 1.0f );
++		u_openhdrDebandRadius = std::clamp( float( cv_openhdr_deband_radius ), 1.0f, 32.0f );
++		u_openhdrDebandThreshold = std::clamp( float( cv_openhdr_deband_threshold ), 0.0f, 0.01f );
++		u_openhdrDitherStrength = std::clamp( float( cv_openhdr_dither_strength ), 0.0f, 1.0f );
+ 	}
+ };
+ 
+@@ -3837,6 +3858,12 @@ struct RcasPushData_t
+     float u_itmSdrNits; // unset
+     float u_itmTargetNits; // unset
+ 
++	uint32_t u_openhdrEnabled;
++	float u_openhdrDebandStrength;
++	float u_openhdrDebandRadius;
++	float u_openhdrDebandThreshold;
++	float u_openhdrDitherStrength;
++
+ 	RcasPushData_t(const struct FrameInfo_t *frameInfo, float sharpness)
+ 	{
+ 		uvec4_t tmp;
+@@ -3881,6 +3908,11 @@ struct RcasPushData_t
+ 		u_nitsToLinear = 1.0f / g_flInternalDisplayBrightnessNits;
+ 		u_itmSdrNits = g_flHDRItmSdrNits;
+ 		u_itmTargetNits = g_flHDRItmTargetNits;
++		u_openhdrEnabled = cv_openhdr_enabled ? 1u : 0u;
++		u_openhdrDebandStrength = std::clamp( float( cv_openhdr_deband_strength ), 0.0f, 1.0f );
++		u_openhdrDebandRadius = std::clamp( float( cv_openhdr_deband_radius ), 1.0f, 32.0f );
++		u_openhdrDebandThreshold = std::clamp( float( cv_openhdr_deband_threshold ), 0.0f, 0.01f );
++		u_openhdrDitherStrength = std::clamp( float( cv_openhdr_dither_strength ), 0.0f, 1.0f );
+ 
+ 		for (uint32_t i = 1; i < k_nMaxLayers; i++)
+ 		{
+diff --git a/src/shaders/blit_push_data.h b/src/shaders/blit_push_data.h
+index caff0f3..1120fe5 100644
+--- a/src/shaders/blit_push_data.h
++++ b/src/shaders/blit_push_data.h
+@@ -16,5 +16,10 @@ uniform layers_t {
+     float u_nitsToLinear; // hdr -> sdr
+     float u_itmSdrNits;
+     float u_itmTargetNits;
+-};
+ 
++    uint u_openhdrEnabled;
++    float u_openhdrDebandStrength;
++    float u_openhdrDebandRadius;
++    float u_openhdrDebandThreshold;
++    float u_openhdrDitherStrength;
++};
+diff --git a/src/shaders/colorimetry.h b/src/shaders/colorimetry.h
+index 00adebf..85c7ac8 100644
+--- a/src/shaders/colorimetry.h
++++ b/src/shaders/colorimetry.h
+@@ -564,6 +564,9 @@ vec3 perform_3dlut_tetrahedral(vec3 color, sampler3D lut3D) {
+ 
+ vec3 perform_3dlut(vec3 color, sampler3D lut3D)
+ {
+-    return perform_3dlut_tetrahedral(color, lut3D);
++    // The OpenHDR reference path uses ordinary 3D texture trilinear
++    // interpolation. The custom build keeps the full 49^3 LUT resolution, so
++    // use the native one-fetch path instead of reinterpreting the baked LUT as
++    // a tetrahedral transform.
++    return perform_3dlut_native(color, lut3D);
+ }
+-
+diff --git a/src/shaders/composite.h b/src/shaders/composite.h
+index 961379b..8fc1f4f 100644
+--- a/src/shaders/composite.h
++++ b/src/shaders/composite.h
+@@ -9,6 +9,49 @@ vec4 sampleRegular(sampler2D tex, vec2 coord, uint colorspace) {
+     return color;
+ }
+ 
++uint openhdr_hash_u32(uvec2 p, uint seed) {
++    uint hash = p.x * 0x9e3779b9u + p.y * 0x85ebca6bu + seed;
++    hash ^= hash >> 16;
++    hash *= 0x7feb352du;
++    hash ^= hash >> 15;
++    hash *= 0x846ca68bu;
++    return hash ^ (hash >> 16);
++}
++
++float openhdr_hash21(uvec2 p, uint seed) {
++    return float(openhdr_hash_u32(p, seed) & 0x00ffffffu) / 16777216.0f;
++}
++
++float openhdr_ign(vec2 p) {
++    return fract(52.9829189f * fract(dot(p, vec2(0.06711056f, 0.00583715f))));
++}
++
++vec4 sampleOpenHDR(sampler2D tex, vec2 coord, vec2 texSize, uint colorspace, bool unnormalized) {
++    vec2 pixel = unnormalized ? coord : coord * texSize;
++    ivec2 maxPixel = ivec2(texSize) - ivec2(1);
++    ivec2 centerPixel = clamp(ivec2(floor(pixel)), ivec2(0), maxPixel);
++    vec4 centerSample = texelFetch(tex, centerPixel, 0);
++    vec3 center = clamp(centerSample.rgb, vec3(0.0f), vec3(1.0f));
++
++    vec3 filtered = center;
++    if (u_openhdrDebandStrength > 0.001f) {
++        uvec2 tile = uvec2(centerPixel) >> 3;
++        float pr1 = openhdr_hash21(tile, 0x243f6a88u);
++        vec2 rawDirection = vec2(
++            openhdr_hash21(tile, 0x13198a2eu),
++            openhdr_hash21(tile, 0xa4093822u)) * 2.0f - 1.0f;
++        rawDirection *= inversesqrt(max(dot(rawDirection, rawDirection), 0.0001f));
++        ivec2 direction = ivec2((pr1 * u_openhdrDebandRadius) * rawDirection);
++        vec3 average = 0.5f * (
++            texelFetch(tex, clamp(centerPixel + direction, ivec2(0), maxPixel), 0).rgb +
++            texelFetch(tex, clamp(centerPixel - direction, ivec2(0), maxPixel), 0).rgb);
++        vec3 smoothCandidate = mix(average, center, step(vec3(u_openhdrDebandThreshold), abs(center - average)));
++        filtered = clamp(mix(center, smoothCandidate, u_openhdrDebandStrength), vec3(0.0f), vec3(1.0f));
++    }
++    centerSample.rgb = colorspace_plane_degamma_tf(filtered, colorspace);
++    return centerSample;
++}
++
+ // To be considered pseudo-bandlimited, upscaling factor must be at least 2x.
+ 
+ const float bandlimited_PI = 3.14159265359;
+@@ -165,7 +208,14 @@ vec4 sampleLayerEx(sampler2D layerSampler, uint offsetLayerIdx, uint colorspaceL
+ 
+     uint colorspace = get_layer_colorspace(colorspaceLayerIdx);
+     vec4 color;
+-    if (get_layer_shaderfilter(offsetLayerIdx) == filter_pixel) {
++    // NVIDIA's compiler rejects the expanded deband path in Gamescope's
++    // multi-layer shader variant. The signed 49^3 look remains active while an
++    // overlay is visible; pause only this pre-pass until gameplay is one layer
++    // again.
++    if (c_layerCount == 1 && offsetLayerIdx == 0 && u_openhdrEnabled != 0u) {
++        color = sampleOpenHDR(layerSampler, coord, texSize, colorspace, unnormalized);
++    }
++    else if (get_layer_shaderfilter(offsetLayerIdx) == filter_pixel) {
+         vec2 output_res = texSize / u_scale[offsetLayerIdx];
+         vec2 extent = max((texSize / output_res), vec2(1.0 / 256.0));
+         color = sampleBandLimited(layerSampler, coord, unnormalized ? vec2(1.0f) : texSize, unnormalized ? vec2(1.0f) : vec2(1.0f) / texSize, extent, colorspace, unnormalized);
+@@ -190,3 +240,18 @@ vec4 sampleLayer(sampler2D layerSampler, uint layerIdx, vec2 uv, bool unnormaliz
+ vec3 encodeOutputColor(vec3 value) {
+     return colorspace_output_tf(value, c_output_eotf);
+ }
++
++vec3 applyOpenHDRPostDither(vec3 encodedColor, uvec2 coord) {
++    if (c_layerCount == 1 && u_openhdrEnabled != 0u && u_openhdrDitherStrength > 0.001f) {
++        vec2 pixel = vec2(coord);
++        float tpdf = openhdr_ign(pixel + vec2(0.5f)) +
++                     openhdr_ign(pixel + vec2(19.19f, 47.47f)) - 1.0f;
++        // Dither what is actually quantized. HDR presentation is PQ/10-bit;
++        // retain an 8-bit fallback for non-HDR output instead of allowing the
++        // nonlinear OpenHDR look to amplify an SDR-domain 1/255 perturbation.
++        float levels = c_output_eotf == EOTF_PQ ? 1023.0f : 255.0f;
++        encodedColor = clamp(encodedColor + vec3(tpdf * u_openhdrDitherStrength / levels),
++                             vec3(0.0f), vec3(1.0f));
++    }
++    return encodedColor;
++}
+diff --git a/src/shaders/cs_composite_blit.comp b/src/shaders/cs_composite_blit.comp
+index b728d46..96e8a2b 100644
+--- a/src/shaders/cs_composite_blit.comp
++++ b/src/shaders/cs_composite_blit.comp
+@@ -42,6 +42,7 @@ void main() {
+     }
+ 
+     outputValue.rgb = encodeOutputColor(outputValue.rgb);
++    outputValue.rgb = applyOpenHDRPostDither(outputValue.rgb, coord);
+     imageStore(dst, ivec2(coord), outputValue);
+ 
+     // Indicator to quickly tell if we're in the compositing path or not.
+diff --git a/src/shaders/cs_composite_rcas.comp b/src/shaders/cs_composite_rcas.comp
+index 20cad55..61e3c87 100644
+--- a/src/shaders/cs_composite_rcas.comp
++++ b/src/shaders/cs_composite_rcas.comp
+@@ -29,6 +29,12 @@ uniform layers_t {
+     float u_nitsToLinear;
+     float u_itmSdrNits;
+     float u_itmTargetNits;
++
++    uint u_openhdrEnabled;
++    float u_openhdrDebandStrength;
++    float u_openhdrDebandRadius;
++    float u_openhdrDebandThreshold;
++    float u_openhdrDitherStrength;
+ };
+ 
+ #include "composite.h"
+@@ -62,16 +68,21 @@ void rcasComposite(uvec2 pos)
+         uvec2 layer0Extent = uvec2(textureSize(s_samplers[0], 0));
+ 
+         if (all(lessThan(rcasPos, layer0Extent))) {
+-            FsrRcasF(outputValue.r, outputValue.g, outputValue.b, rcasPos, u_c1.xxxx);
+-
+             uint colorspace = get_layer_colorspace(0);
+-            if (colorspace == colorspace_linear)
++            if (u_openhdrEnabled != 0u)
+             {
+-                // We don't use an sRGB view for FSR due to the spaces RCAS works in.
+-                colorspace = colorspace_sRGB;
++                outputValue = sampleOpenHDR(s_samplers[0], vec2(rcasPos), vec2(layer0Extent), colorspace, true).rgb;
++            }
++            else
++            {
++                FsrRcasF(outputValue.r, outputValue.g, outputValue.b, rcasPos, u_c1.xxxx);
++                if (colorspace == colorspace_linear)
++                {
++                    // We don't use an sRGB view for FSR due to the spaces RCAS works in.
++                    colorspace = colorspace_sRGB;
++                }
++                outputValue.rgb = colorspace_plane_degamma_tf(outputValue.rgb, colorspace);
+             }
+-
+-            outputValue.rgb = colorspace_plane_degamma_tf(outputValue.rgb, colorspace);
+             outputValue.rgb = (vec4(outputValue.rgb, 1.0f) * u_ctm[0]).rgb;
+             outputValue.rgb = apply_layer_color_mgmt(outputValue.rgb, 0, colorspace);
+             outputValue *= u_opacity[0];
+@@ -89,6 +100,7 @@ void rcasComposite(uvec2 pos)
+     }
+ 
+     outputValue = encodeOutputColor(outputValue);
++    outputValue = applyOpenHDRPostDither(outputValue, pos);
+     imageStore(dst, ivec2(pos), vec4(outputValue, 0));
+ 
+     if (checkDebugFlag(compositedebug_Markers))
+@@ -108,4 +120,3 @@ void main()
+     pos.x -= 8u;
+     rcasComposite(pos);
+ }
+-
+diff --git a/src/shaders/cs_gaussian_blur_horizontal.comp b/src/shaders/cs_gaussian_blur_horizontal.comp
+index 2037f1c..21e5899 100644
+--- a/src/shaders/cs_gaussian_blur_horizontal.comp
++++ b/src/shaders/cs_gaussian_blur_horizontal.comp
+@@ -26,10 +26,18 @@ uniform layers_t {
+     // hdr
+     float u_linearToNits;
+     float u_nitsToLinear;
+-    float u_itmSdrNits;
+-    float u_itmTargetNits;
++	float u_itmSdrNits;
++	float u_itmTargetNits;
+ };
+ 
++// This auxiliary shader shares composite.h but never runs the OpenHDR
++// presentation path. Keep its push-constant layout unchanged.
++const uint u_openhdrEnabled = 0u;
++const float u_openhdrDebandStrength = 0.0f;
++const float u_openhdrDebandRadius = 0.0f;
++const float u_openhdrDebandThreshold = 0.0f;
++const float u_openhdrDitherStrength = 0.0f;
++
+ #include "composite.h"
+ #include "blur.h"
+ 
+@@ -62,4 +70,3 @@ void main()
+     outputValue = colorspace_plane_regamma_tf(outputValue, colorspace);
+     imageStore(dst, ivec2(coord), vec4(outputValue, 0));
+ }
+-
+diff --git a/src/shaders/cs_rgb_to_nv12.comp b/src/shaders/cs_rgb_to_nv12.comp
+index 1884424..383026f 100644
+--- a/src/shaders/cs_rgb_to_nv12.comp
++++ b/src/shaders/cs_rgb_to_nv12.comp
+@@ -22,6 +22,12 @@ const float u_linearToNits = 400.0f;
+ const float u_nitsToLinear = 1.0f / 100.0f;
+ const float u_itmSdrNits = 100.f;
+ const float u_itmTargetNits = 1000.f;
++// Video encode/capture conversion is not the display presentation pass.
++const uint u_openhdrEnabled = 0u;
++const float u_openhdrDebandStrength = 0.0f;
++const float u_openhdrDebandRadius = 0.0f;
++const float u_openhdrDebandThreshold = 0.0f;
++const float u_openhdrDitherStrength = 0.0f;
+ 
+ layout(binding = 0, scalar)
+ uniform layers_t {
+diff --git a/src/Backends/WaylandBackend.cpp b/src/Backends/WaylandBackend.cpp
+index abdf782..3c6baf2 100644
+--- a/src/Backends/WaylandBackend.cpp
++++ b/src/Backends/WaylandBackend.cpp
+@@ -719,6 +719,13 @@ namespace gamescope
+             return &iter->second;
+         }
+ 
++        wl_output *GetOutputForNestedDisplayIndex() const
++        {
++            if ( g_nNestedDisplayIndex < 0 || size_t( g_nNestedDisplayIndex ) >= m_pOutputOrder.size() )
++                return nullptr;
++            return m_pOutputOrder[ g_nNestedDisplayIndex ];
++        }
++
+ 		wl_region *GetEmptyRegion() const { return m_pEmptyRegion; }
+         wl_region *GetFullRegion() const { return m_pFullRegion; }
+         CWaylandFb *GetBlackFb() const { return m_BlackFb.get(); }
+@@ -819,6 +826,7 @@ namespace gamescope
+         } m_WPColorManagerFeatures;
+ 
+         std::unordered_map<wl_output *, WaylandOutputInfo> m_pOutputs;
++        std::vector<wl_output *> m_pOutputOrder;
+ 
+         libdecor *m_pLibDecor = nullptr;
+ 
+@@ -1033,7 +1041,7 @@ namespace gamescope
+         {
+             if ( m_bDesiredFullscreenState )
+-                libdecor_frame_set_fullscreen( m_Planes[0].GetFrame(), nullptr );
++                libdecor_frame_set_fullscreen( m_Planes[0].GetFrame(), m_pBackend->GetOutputForNestedDisplayIndex() );
+             else
+                 libdecor_frame_unset_fullscreen( m_Planes[0].GetFrame() );
+ 
+             g_bFullscreen = m_bDesiredFullscreenState;
+@@ -2526,6 +2534,7 @@ namespace gamescope
+             wl_output *pOutput  = (wl_output *)wl_registry_bind( pRegistry, uName, &wl_output_interface, 4u );
+             wl_output_add_listener( pOutput , &s_OutputListener, this );
+             m_pOutputs.emplace( std::make_pair<struct wl_output *, WaylandOutputInfo>( std::move( pOutput ), WaylandOutputInfo{} ) );
++            m_pOutputOrder.emplace_back( pOutput );
+         }
+         else if ( !strcmp( pInterface, frog_color_management_factory_v1_interface.name ) )
+         {

@@ -1,0 +1,463 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+peak_nits=1000
+paper_white_nits=65
+contrast=120
+saturation=110
+output_scale=100
+deband_strength=100
+deband_radius=16
+deband_threshold=3
+dithering=1
+dither_strength=100
+black_floor=20
+enabled=1
+fullscreen=1
+gpu_id=${OPENHDR_GPU:-}
+gpu_name=
+game_width=${OPENHDR_WIDTH:-}
+game_height=${OPENHDR_HEIGHT:-}
+game_refresh=${OPENHDR_REFRESH:-}
+display_index=${OPENHDR_DISPLAY_INDEX:-}
+display_name=${OPENHDR_DISPLAY_NAME:-}
+
+config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/openhdr
+profile_key=${OPENHDR_PROFILE:-}
+if [[ -z $profile_key ]]; then
+  steam_app_id=${SteamAppId:-${SteamGameId:-${STEAM_COMPAT_APP_ID:-}}}
+  if [[ $steam_app_id =~ ^[0-9]+$ && $steam_app_id != 0 ]]; then
+    profile_key=steam-$steam_app_id
+  else
+    command_path=
+    found_separator=0
+    for argument in "$@"; do
+      if ((found_separator)); then
+        command_path=$argument
+        break
+      fi
+      [[ $argument == -- ]] && found_separator=1
+    done
+    command_name=${command_path##*/}
+    command_name=${command_name:-game}
+    profile_key=exe-${command_name,,}
+  fi
+fi
+profile_key=$(printf '%s' "$profile_key" | tr -cs '[:alnum:]_.-' '-' | sed 's/^-//; s/-$//')
+profile_key=${profile_key:-game}
+profile_name=${OPENHDR_PROFILE_NAME:-}
+if [[ -z $profile_name && -n ${STEAM_COMPAT_INSTALL_PATH:-} ]]; then
+  profile_name=${STEAM_COMPAT_INSTALL_PATH##*/}
+fi
+profile_name=${profile_name:-$profile_key}
+config_file=$config_dir/games/$profile_key.conf
+display_file=$config_dir/games/$profile_key.display
+legacy_config_file=$config_dir/settings.conf
+if [[ -z $display_name && -r $display_file ]]; then
+  read -r display_name < "$display_file"
+fi
+settings_file=$config_file
+if [[ ! -r $settings_file && -r $legacy_config_file ]]; then
+  # Seed a game's first profile from the former global settings. The first
+  # menu change writes the game-specific file and isolates future launches.
+  settings_file=$legacy_config_file
+fi
+if [[ -r $settings_file ]]; then
+  while IFS='=' read -r key value; do
+    case $key in
+      enabled) enabled=$value ;;
+      peak) peak_nits=$value ;;
+      paper_white) paper_white_nits=$value ;;
+      contrast) contrast=$value ;;
+      saturation) saturation=$value ;;
+      output_scale) output_scale=$value ;;
+      deband_strength) deband_strength=$value ;;
+      deband_radius) deband_radius=$value ;;
+      deband_threshold) deband_threshold=$value ;;
+      dithering) dithering=$value ;;
+      dither_strength) dither_strength=$value ;;
+      black_floor) black_floor=$value ;;
+    esac
+  done < "$settings_file"
+fi
+
+detect_display_gpu() {
+  local card connector status vendor device candidate selected=
+  for card in /sys/class/drm/card[0-9]*; do
+    [[ -r $card/device/vendor && -r $card/device/device ]] || continue
+    for connector in "$card"-*; do
+      [[ -r $connector/status ]] || continue
+      read -r status < "$connector/status"
+      [[ $status == connected ]] || continue
+      read -r vendor < "$card/device/vendor"
+      read -r device < "$card/device/device"
+      candidate=${vendor#0x}:${device#0x}
+      candidate=${candidate,,}
+      if [[ -n $selected && $selected != "$candidate" ]]; then
+        # More than one GPU drives a connected display. Do not guess; require
+        # --gpu/OPENHDR_GPU so the requested output remains unambiguous.
+        return 1
+      fi
+      selected=$candidate
+      break
+    done
+  done
+  [[ -n $selected ]] && printf '%s\n' "$selected"
+}
+
+display_gpu_name() {
+  local card vendor device pci_path info model
+  for card in /sys/class/drm/card[0-9]*; do
+    [[ -r $card/device/vendor && -r $card/device/device ]] || continue
+    read -r vendor < "$card/device/vendor"
+    read -r device < "$card/device/device"
+    if [[ ${vendor#0x}:${device#0x} == "$1" ]]; then
+      pci_path=$(readlink -f "$card/device")
+      info=/proc/driver/nvidia/gpus/${pci_path##*/}/information
+      if [[ -r $info ]]; then
+        model=$(sed -n 's/^Model:[[:space:]]*//p' "$info" | head -n 1)
+        [[ -n $model ]] && printf '%s\n' "$model"
+      fi
+      return
+    fi
+  done
+}
+
+detect_primary_mode() {
+  local mode=
+  if command -v kscreen-doctor >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    mode=$(kscreen-doctor --json 2>/dev/null | jq -r '
+      [.outputs[] | select(.enabled and .connected)]
+      | sort_by(.priority) | .[0]
+      | .currentModeId as $current
+      | .modes[] | select(.id == $current)
+      | "\(.size.width) \(.size.height) \(.refreshRate)"
+    ' 2>/dev/null || true)
+  fi
+  if [[ ! $mode =~ ^[0-9]+[[:space:]][0-9]+[[:space:]][0-9]+([.][0-9]+)?$ ]] && command -v xrandr >/dev/null 2>&1; then
+    mode=$(xrandr --current 2>/dev/null | awk '
+      / connected primary / {
+        if (match($0, /[0-9]+x[0-9]+\+/)) {
+          resolution = substr($0, RSTART, RLENGTH - 1)
+          split(resolution, dimensions, "x")
+          print dimensions[1], dimensions[2], ""
+          exit
+        }
+      }
+    ' || true)
+  fi
+  [[ $mode =~ ^[0-9]+[[:space:]][0-9]+([[:space:]][0-9]+([.][0-9]+)?)?$ ]] && printf '%s\n' "$mode"
+}
+
+wayland_display_index_for_name() {
+  local target=$1
+  command -v wayland-info >/dev/null 2>&1 || return 1
+  wayland-info 2>/dev/null | awk -v target="$target" '
+    /interface: .wl_output./ { output_index++; in_output = 1; next }
+    in_output && /^[[:space:]]+name: / {
+      if ($2 == target) { print output_index - 1; exit }
+    }
+    /^interface:/ { in_output = 0 }
+  '
+}
+
+detect_primary_display_index() {
+  local primary_name
+  command -v kscreen-doctor >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  primary_name=$(kscreen-doctor --json 2>/dev/null | jq -r '
+    [.outputs[] | select(.enabled and .connected)]
+    | sort_by(.priority) | .[0].name // empty
+  ') || return 1
+  [[ -n $primary_name ]] || return 1
+  wayland_display_index_for_name "$primary_name"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: openhdr-linux [options] -- command [arguments...]
+
+Run an SDR game through OpenHDR's 49^3 LUT and RTX control atlas.
+
+Options:
+  --peak NITS         Display peak brightness (default: 1000)
+  --paper-white NITS  OpenHDR gray/paper-white control (default: 65)
+  --contrast VALUE    Contrast control, 0-200 (default: 120)
+  --saturation VALUE  Saturation control, 0-200 (default: 110)
+  --output-scale PCT  Output intensity, 25-200 (default: 100)
+  --deband-strength PCT  Deband blend, 0-100 (default: 100)
+  --deband-radius PX  Deband sample radius, 1-32 (default: 16)
+  --deband-threshold VALUE  Edge threshold in per-mille, 0-10 (default: 3)
+  --dither-strength PCT  Dither strength, 0-100 (default: 100)
+  --black-floor VALUE  Shadow gate in per-mille, 0-50 (default: 20)
+  --no-dither        Disable TPDF dithering
+  --width PX          Game/output width (default: active display mode)
+  --height PX         Game/output height (default: active display mode)
+  --refresh HZ        Nested refresh rate (default: active display mode)
+  --display NAME      Wayland output connector, such as DP-4
+  --windowed          Open Gamescope in a window instead of fullscreen
+  --gpu PCI_ID        GPU used by the desktop, as vendor:device (for multi-GPU systems)
+  -h, --help          Show this help
+
+Steam launch options:
+  /path/to/openhdr-linux -- %command%
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    --peak)
+      [[ $# -ge 2 ]] || { echo "openhdr-linux: --peak needs a value" >&2; exit 2; }
+      peak_nits=$2
+      shift 2
+      ;;
+    --paper-white)
+      [[ $# -ge 2 ]] || { echo "openhdr-linux: --paper-white needs a value" >&2; exit 2; }
+      paper_white_nits=$2
+      shift 2
+      ;;
+    --contrast)
+      [[ $# -ge 2 ]] || { echo "openhdr-linux: --contrast needs a value" >&2; exit 2; }
+      contrast=$2
+      shift 2
+      ;;
+    --saturation)
+      [[ $# -ge 2 ]] || { echo "openhdr-linux: --saturation needs a value" >&2; exit 2; }
+      saturation=$2
+      shift 2
+      ;;
+    --output-scale)
+      [[ $# -ge 2 ]] || { echo "openhdr-linux: --output-scale needs a value" >&2; exit 2; }
+      output_scale=$2
+      shift 2
+      ;;
+    --deband-strength)
+      [[ $# -ge 2 ]] || { echo "openhdr-linux: --deband-strength needs a value" >&2; exit 2; }
+      deband_strength=$2
+      shift 2
+      ;;
+    --deband-radius)
+      [[ $# -ge 2 ]] || { echo "openhdr-linux: --deband-radius needs a value" >&2; exit 2; }
+      deband_radius=$2
+      shift 2
+      ;;
+    --deband-threshold)
+      [[ $# -ge 2 ]] || { echo "openhdr-linux: --deband-threshold needs a value" >&2; exit 2; }
+      deband_threshold=$2
+      shift 2
+      ;;
+    --dither-strength)
+      [[ $# -ge 2 ]] || { echo "openhdr-linux: --dither-strength needs a value" >&2; exit 2; }
+      dither_strength=$2
+      shift 2
+      ;;
+    --black-floor)
+      [[ $# -ge 2 ]] || { echo "openhdr-linux: --black-floor needs a value" >&2; exit 2; }
+      black_floor=$2
+      shift 2
+      ;;
+    --no-dither)
+      dithering=0
+      shift
+      ;;
+    --width)
+      [[ $# -ge 2 ]] || { echo "openhdr-linux: --width needs a value" >&2; exit 2; }
+      game_width=$2
+      shift 2
+      ;;
+    --height)
+      [[ $# -ge 2 ]] || { echo "openhdr-linux: --height needs a value" >&2; exit 2; }
+      game_height=$2
+      shift 2
+      ;;
+    --refresh)
+      [[ $# -ge 2 ]] || { echo "openhdr-linux: --refresh needs a value" >&2; exit 2; }
+      game_refresh=$2
+      shift 2
+      ;;
+    --display)
+      [[ $# -ge 2 ]] || { echo "openhdr-linux: --display needs a value" >&2; exit 2; }
+      display_name=$2
+      shift 2
+      ;;
+    --windowed)
+      fullscreen=0
+      shift
+      ;;
+    --gpu)
+      [[ $# -ge 2 ]] || { echo "openhdr-linux: --gpu needs a value" >&2; exit 2; }
+      gpu_id=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      echo "openhdr-linux: unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+[[ $# -gt 0 ]] || { echo "openhdr-linux: no game command supplied" >&2; usage >&2; exit 2; }
+[[ $peak_nits =~ ^[0-9]+$ ]] || { echo "openhdr-linux: peak must be an integer" >&2; exit 2; }
+[[ $paper_white_nits =~ ^[0-9]+$ ]] || { echo "openhdr-linux: paper white must be an integer" >&2; exit 2; }
+[[ $contrast =~ ^[0-9]+$ ]] && ((contrast <= 200)) || { echo "openhdr-linux: contrast must be 0-200" >&2; exit 2; }
+[[ $saturation =~ ^[0-9]+$ ]] && ((saturation <= 200)) || { echo "openhdr-linux: saturation must be 0-200" >&2; exit 2; }
+[[ $output_scale =~ ^[0-9]+$ ]] && ((output_scale >= 25 && output_scale <= 200)) || { echo "openhdr-linux: output scale must be 25-200" >&2; exit 2; }
+[[ $deband_strength =~ ^[0-9]+$ ]] && ((deband_strength <= 100)) || { echo "openhdr-linux: deband strength must be 0-100" >&2; exit 2; }
+[[ $deband_radius =~ ^[0-9]+$ ]] && ((deband_radius >= 1 && deband_radius <= 32)) || { echo "openhdr-linux: deband radius must be 1-32" >&2; exit 2; }
+[[ $deband_threshold =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+  awk -v value="$deband_threshold" 'BEGIN { exit !(value >= 0 && value <= 10) }' ||
+  { echo "openhdr-linux: deband threshold must be 0-10" >&2; exit 2; }
+[[ $dither_strength =~ ^[0-9]+$ ]] && ((dither_strength <= 100)) || { echo "openhdr-linux: dither strength must be 0-100" >&2; exit 2; }
+[[ $black_floor =~ ^[0-9]+$ ]] && ((black_floor <= 50)) || { echo "openhdr-linux: black floor must be 0-50" >&2; exit 2; }
+[[ $enabled == 0 || $enabled == 1 ]] || enabled=1
+[[ $dithering == 0 || $dithering == 1 ]] || dithering=1
+if [[ -n $game_width || -n $game_height ]]; then
+  [[ $game_width =~ ^[0-9]+$ && $game_height =~ ^[0-9]+$ ]] &&
+    ((game_width > 0 && game_height > 0)) ||
+    { echo "openhdr-linux: width and height must both be positive integers" >&2; exit 2; }
+fi
+[[ -z $game_refresh || $game_refresh =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+  { echo "openhdr-linux: refresh must be numeric" >&2; exit 2; }
+
+[[ ${XDG_SESSION_TYPE:-} == wayland ]] ||
+  echo "openhdr-linux: warning: a Wayland session is recommended for HDR." >&2
+
+if [[ -z $gpu_id ]]; then
+  gpu_id=$(detect_display_gpu || true)
+fi
+
+if [[ -n $gpu_id ]]; then
+  gpu_name=$(display_gpu_name "$gpu_id")
+  if [[ -n $gpu_name ]]; then
+    echo "OpenHDR: using display GPU $gpu_name ($gpu_id)" >&2
+    # Subnautica is D3D11/DXVK, while other Proton games may use VKD3D. Keep
+    # the client renderer on the same GPU as Gamescope unless the caller has
+    # deliberately supplied a different filter.
+    export DXVK_FILTER_DEVICE_NAME=${DXVK_FILTER_DEVICE_NAME:-$gpu_name}
+    export VKD3D_FILTER_DEVICE_NAME=${VKD3D_FILTER_DEVICE_NAME:-$gpu_name}
+  else
+    echo "OpenHDR: using display/compositor GPU $gpu_id" >&2
+  fi
+else
+  echo "openhdr-linux: warning: could not uniquely detect the display GPU; use --gpu vendor:device." >&2
+fi
+
+if [[ -z $game_width && -z $game_height ]]; then
+  read -r game_width game_height detected_refresh < <(detect_primary_mode || true) || true
+  game_refresh=${game_refresh:-${detected_refresh:-}}
+fi
+
+if [[ -z $display_index ]]; then
+  if [[ -n $display_name ]]; then
+    # A monitor waking from standby may join KWin a moment after Steam starts
+    # the game. Wait for the pinned connector instead of silently opening on a
+    # different display whose enumeration index happened to be zero.
+    for _attempt in {1..50}; do
+      display_index=$(wayland_display_index_for_name "$display_name" || true)
+      [[ $display_index =~ ^[0-9]+$ ]] && break
+      sleep 0.1
+    done
+    if [[ ! $display_index =~ ^[0-9]+$ ]]; then
+      echo "openhdr-linux: configured display $display_name is not available" >&2
+      exit 1
+    fi
+    echo "OpenHDR: using display $display_name (Gamescope index $display_index)" >&2
+  else
+    display_index=$(detect_primary_display_index || true)
+  fi
+fi
+
+if [[ -n $game_width && -n $game_height ]]; then
+  echo "OpenHDR: advertising ${game_width}x${game_height}${game_refresh:+ @ ${game_refresh} Hz} to the game" >&2
+fi
+
+gamescope_args=(
+  --hdr-enabled
+  # Use Gamescope's standard SDR-on-HDR reference for genuine bypass. The
+  # patched look path restores OpenHDR's separate 2000-nit transport scale.
+  --hdr-sdr-content-nits 203
+  --sdr-gamut-wideness 0
+)
+
+if [[ $display_index =~ ^[0-9]+$ ]]; then
+  gamescope_args+=(--display-index "$display_index")
+fi
+
+if [[ -n $game_width && -n $game_height ]]; then
+  gamescope_args+=(-W "$game_width" -H "$game_height" -w "$game_width" -h "$game_height")
+fi
+if [[ -n $game_refresh ]]; then
+  gamescope_args+=(-r "$game_refresh")
+fi
+
+if ((fullscreen)); then
+  gamescope_args+=(-f)
+fi
+
+if [[ -n $gpu_id ]]; then
+  gamescope_args+=(--prefer-vk-device "$gpu_id")
+fi
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+gamescope_bin=$script_dir/linux/bin/gamescope-openhdr
+if [[ ! -x $gamescope_bin ]]; then
+  echo "openhdr-linux: the 49^3 OpenHDR Gamescope build is missing." >&2
+  echo "Run: $script_dir/linux/build-gamescope.sh" >&2
+  exit 127
+fi
+cache_dir=${XDG_CACHE_HOME:-$HOME/.cache}/openhdr
+look_file="$cache_dir/look-p${peak_nits}-w${paper_white_nits}-c${contrast}-s${saturation}-o${output_scale}-b${black_floor}.cube"
+mkdir -p "$cache_dir"
+mkdir -p "$config_dir"
+chmod +x "$script_dir/linux/launch-game"
+
+if [[ ! -s $look_file || $script_dir/lut3d_49.bin -nt $look_file || $script_dir/rtx_control_atlas.bin -nt $look_file || $script_dir/linux/generate_look.py -nt $look_file ]]; then
+  python3 "$script_dir/linux/generate_look.py" \
+    --lut "$script_dir/lut3d_49.bin" \
+    --atlas "$script_dir/rtx_control_atlas.bin" \
+    --output "$look_file" \
+    --peak "$peak_nits" \
+    --paper-white "$paper_white_nits" \
+    --contrast "$contrast" \
+    --saturation "$saturation" \
+    --output-scale "$output_scale" \
+    --black-floor "$black_floor"
+fi
+
+live_look_file=$cache_dir/look-live-$profile_key.cube
+# Start the live-edit target from the exact LUT loaded for this profile. This
+# prevents the enable switch from briefly restoring a stale LUT while the
+# asynchronous rebuild catches up.
+cp --reflink=auto -- "$look_file" "$live_look_file"
+
+export OPENHDR_LOOK=$look_file
+export OPENHDR_MENU=$script_dir/linux/bin/openhdr-menu
+export OPENHDR_GENERATOR=$script_dir/linux/generate_look.py
+export OPENHDR_LUT=$script_dir/lut3d_49.bin
+export OPENHDR_ATLAS=$script_dir/rtx_control_atlas.bin
+export OPENHDR_CONFIG=$config_file
+export OPENHDR_PROFILE_KEY=$profile_key
+export OPENHDR_PROFILE_NAME=$profile_name
+export OPENHDR_LIVE_LOOK=$live_look_file
+export OPENHDR_ENABLED=$enabled
+export OPENHDR_PEAK=$peak_nits
+export OPENHDR_PAPER_WHITE=$paper_white_nits
+export OPENHDR_CONTRAST=$contrast
+export OPENHDR_SATURATION=$saturation
+export OPENHDR_OUTPUT_SCALE=$output_scale
+export OPENHDR_DEBAND_STRENGTH=$deband_strength
+export OPENHDR_DEBAND_RADIUS=$deband_radius
+export OPENHDR_DEBAND_THRESHOLD=$deband_threshold
+export OPENHDR_DITHERING=$dithering
+export OPENHDR_DITHER_STRENGTH=$dither_strength
+export OPENHDR_BLACK_FLOOR=$black_floor
+exec "$gamescope_bin" "${gamescope_args[@]}" -- "$script_dir/linux/launch-game" "$@"

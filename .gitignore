@@ -10,3 +10,6 @@ obj/
 *.lib
 *.ipdb
 *.iobj
+linux/bin/
+linux/__pycache__/
+work/
